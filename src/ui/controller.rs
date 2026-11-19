@@ -92,21 +92,38 @@ fn slice_to_16(bytes: &[u8], is_iv: bool) -> Result<[u8; 16], AesError> {
     })
 }
 
-fn parse_key_and_iv(req: &CryptoRequest<'_>) -> Result<([u8; 16], Option<[u8; 16]>), AesError> {
-    let key = parse_fixed_16(req.key_text, req.key_format, false)?;
-    let iv = if req.mode.requires_iv() {
-        let is_empty = match req.iv_format {
-            KeyFormat::Utf8 => req.iv_text.is_empty(),
-            KeyFormat::Hex => req.iv_text.trim().is_empty(),
+/// Validates and parses the key and optional initialization vector for a cipher mode.
+pub(crate) fn parse_key_and_iv_fields(
+    mode: CipherMode,
+    key_format: KeyFormat,
+    key_text: &str,
+    iv_format: KeyFormat,
+    iv_text: &str,
+) -> Result<([u8; 16], Option<[u8; 16]>), AesError> {
+    let key = parse_fixed_16(key_text, key_format, false)?;
+    let iv = if mode.requires_iv() {
+        let is_empty = match iv_format {
+            KeyFormat::Utf8 => iv_text.is_empty(),
+            KeyFormat::Hex => iv_text.trim().is_empty(),
         };
         if is_empty {
             return Err(AesError::MissingIv);
         }
-        Some(parse_fixed_16(req.iv_text, req.iv_format, true)?)
+        Some(parse_fixed_16(iv_text, iv_format, true)?)
     } else {
         None
     };
     Ok((key, iv))
+}
+
+fn parse_key_and_iv(req: &CryptoRequest<'_>) -> Result<([u8; 16], Option<[u8; 16]>), AesError> {
+    parse_key_and_iv_fields(
+        req.mode,
+        req.key_format,
+        req.key_text,
+        req.iv_format,
+        req.iv_text,
+    )
 }
 
 /// Validates inputs, encrypts UTF-8 `input_text`, and formats the resulting ciphertext.
