@@ -1,6 +1,6 @@
 use gpui_kit::{
     Context, IntoElement, ParentElement, Render, Styled, TestSupportExt, Window,
-    component::{ActiveTheme, label::Label},
+    component::{ActiveTheme, StyledExt, label::Label},
     div, prelude::*, px,
 };
 
