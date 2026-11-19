@@ -1,11 +1,17 @@
 # raes-128
 
-A desktop application for AES-128 encryption and decryption built with Rust and [`gpui-kit`](https://crates.io/crates/gpui-kit).
+A pure-Rust AES-128 encryption and decryption desktop application built with [`gpui-kit`](https://crates.io/crates/gpui-kit) and zero external cryptography dependencies.
 
-## Overview
+## Features
 
-- **Custom AES-128 implementation**: AES-128 encryption and decryption will be implemented from scratch in Rust without external cryptography libraries in upcoming stages.
-- **Current stage**: Provides the minimal runnable `gpui-kit` desktop shell (`RaesApp`) and headless UI smoke test; no encryption or decryption functionality is implemented yet.
+- **Pure-Rust AES-128 (FIPS 197)**: Implements SubBytes, ShiftRows, MixColumns, AddRoundKey, 128-bit key expansion, and inverse round transformations from scratch in `src/aes/`.
+- **6 Modes of Operation**: Supports **ECB**, **CBC**, **PCBC**, **CFB**, **OFB**, and **CTR** (with PKCS#7 padding for block modes ECB/CBC/PCBC and stream operation for CFB/OFB/CTR).
+- **Flexible Key & IV Inputs**:
+  - Toggle Key and IV/Counter inputs between **UTF-8 (16 B)** and **Hex (32 chars)** with live length indicators.
+  - Built-in **Random** 128-bit generator for keys and IVs.
+  - IV controls automatically disable when **ECB** mode is selected.
+- **Ciphertext Encoding**: Encode and decode ciphertext in **Hex** or **Base64** (with automatic hex fallback display when decrypted bytes are non-UTF-8).
+- **Interactive Desktop UI**: Encrypt, Decrypt, Use Output as Input (swap), Copy Output to clipboard, Clear, and an accessible live status bar.
 
 ## Commands
 
@@ -21,7 +27,7 @@ Run the desktop application:
 cargo run
 ```
 
-Run tests (including the headless `gpui-kit` UI smoke test):
+Run all unit and headless UI integration tests:
 
 ```bash
 cargo test
