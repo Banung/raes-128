@@ -1,3 +1,5 @@
+pub mod aes;
+
 use gpui_kit::{
     Context, IntoElement, ParentElement, Render, Styled, TestSupportExt, Window,
     component::{ActiveTheme, StyledExt, label::Label},
