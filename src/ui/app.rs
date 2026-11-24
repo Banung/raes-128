@@ -13,7 +13,7 @@ use gpui_kit::component::{
     v_flex,
 };
 
-use crate::aes::CipherMode;
+use crate::aes::{CipherMode, FirstBlockModeTrace, format_trace_text};
 use crate::ui::controller::{
     CiphertextFormat, CryptoRequest, KeyFormat, generate_random_hex_16, run_decrypt, run_encrypt,
 };
@@ -25,6 +25,7 @@ use crate::ui::file_crypto::{
 enum WorkspaceTab {
     Text,
     File,
+    Trace,
 }
 
 /// Interactive desktop application view for pure-Rust AES-128 encryption and decryption.
@@ -40,6 +41,9 @@ pub struct RaesApp {
     output_text: Entity<TextareaState>,
     file_input_path: Entity<InputState>,
     file_output_path: Entity<InputState>,
+    last_trace: Option<FirstBlockModeTrace>,
+    trace_show_all_rounds: bool,
+    trace_output: Entity<TextareaState>,
     status_message: SharedString,
     status_is_error: bool,
 }
@@ -68,6 +72,13 @@ impl RaesApp {
             InputState::new(window, cx)
                 .placeholder("Path to output file (leave blank to auto-suggest)...")
         });
+        let trace_output = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .placeholder(
+                    "Run Encrypt or Decrypt (Text or File) to inspect the AES-128 Step-by-Step Trace...",
+                )
+                .rows(14)
+        });
 
         Self {
             active_tab: WorkspaceTab::Text,
@@ -81,6 +92,9 @@ impl RaesApp {
             output_text,
             file_input_path,
             file_output_path,
+            last_trace: None,
+            trace_show_all_rounds: false,
+            trace_output,
             status_message: "Ready".into(),
             status_is_error: false,
         }
@@ -89,6 +103,15 @@ impl RaesApp {
     fn set_status(&mut self, message: impl Into<SharedString>, is_error: bool) {
         self.status_message = message.into();
         self.status_is_error = is_error;
+    }
+
+    fn refresh_trace_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let formatted = match &self.last_trace {
+            Some(trace) => format_trace_text(trace, self.trace_show_all_rounds),
+            None => String::new(),
+        };
+        self.trace_output
+            .update(cx, |state, cx| state.set_value(formatted, window, cx));
     }
 
     fn run_operation(&mut self, encrypt_op: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -117,6 +140,8 @@ impl RaesApp {
                 let output = res.output;
                 self.output_text
                     .update(cx, |state, cx| state.set_value(output, window, cx));
+                self.last_trace = res.trace;
+                self.refresh_trace_view(window, cx);
                 let status = if encrypt_op {
                     format!(
                         "Encrypted {} bytes -> {} bytes ({}, {})",
@@ -191,6 +216,8 @@ impl RaesApp {
 
         match result {
             Ok(res) => {
+                self.last_trace = res.trace;
+                self.refresh_trace_view(window, cx);
                 let verb = if encrypt_op {
                     "Encrypted file"
                 } else {
@@ -624,6 +651,112 @@ impl RaesApp {
                     ),
             )
     }
+
+    fn render_trace_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let summary_text = match &self.last_trace {
+            Some(trace) => format!(
+                "AES-128-{} • {} (Core: {})",
+                trace.mode.name(),
+                trace.operation.label(),
+                trace.block_trace.direction.label()
+            ),
+            None => "No trace captured yet — run Encrypt or Decrypt in Text or File tab".to_string(),
+        };
+
+        v_flex()
+            .gap_2p5()
+            .w_full()
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_2()
+                    .rounded(px(8.0))
+                    .bg(theme.secondary)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .gap_2()
+                            .child(Label::new("Step-by-Step Trace (Block 0)").font_semibold())
+                            .child(
+                                Label::new(summary_text).text_color(theme.muted_foreground),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .child(
+                                toggle_button(
+                                    "trace-mode-summary",
+                                    "Initial / R1 / Final",
+                                    !self.trace_show_all_rounds,
+                                    false,
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.trace_show_all_rounds = false;
+                                    this.refresh_trace_view(window, cx);
+                                    this.set_status(
+                                        "Showing summary trace (Initial Round, Round 1, Final Round)",
+                                        false,
+                                    );
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                toggle_button(
+                                    "trace-mode-all",
+                                    "All 10 Rounds",
+                                    self.trace_show_all_rounds,
+                                    false,
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.trace_show_all_rounds = true;
+                                    this.refresh_trace_view(window, cx);
+                                    this.set_status(
+                                        "Showing full 10-round trace and all 11 round keys",
+                                        false,
+                                    );
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                Button::new("btn-copy-trace")
+                                    .outline()
+                                    .label("Copy Trace")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        let text = this.trace_output.read(cx).value();
+                                        if text.is_empty() {
+                                            this.set_status("No trace to copy", false);
+                                        } else {
+                                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                                text.to_string(),
+                                            ));
+                                            this.set_status("Copied trace to clipboard", false);
+                                        }
+                                        cx.notify();
+                                    })),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("trace-output")
+                    .test_support()
+                    .w_full()
+                    .font_family(theme.mono_font_family.clone())
+                    .child(
+                        Textarea::new(&self.trace_output)
+                            .accessibility_id("trace-output")
+                            .aria_label("Step-by-Step Trace")
+                            .readonly(true)
+                            .h(px(480.0)),
+                    ),
+            )
+    }
 }
 
 impl Render for RaesApp {
@@ -631,6 +764,7 @@ impl Render for RaesApp {
         let workspace_content = match self.active_tab {
             WorkspaceTab::Text => self.render_text_workspace(cx).into_any_element(),
             WorkspaceTab::File => self.render_file_workspace(cx).into_any_element(),
+            WorkspaceTab::Trace => self.render_trace_workspace(cx).into_any_element(),
         };
 
         let theme = cx.theme();
@@ -654,7 +788,7 @@ impl Render for RaesApp {
             theme.muted_foreground
         };
 
-        v_flex()
+        let mut root = v_flex()
             .size_full()
             .px_5()
             .py_4()
@@ -713,212 +847,260 @@ impl Render for RaesApp {
                                     this.set_status("Switched to File mode", false);
                                     cx.notify();
                                 })),
-                            ),
-                    ),
-            )
-            // Cipher Mode Bar
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .bg(theme.secondary)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(Label::new("Cipher Mode").font_semibold())
+                            )
                             .child(
-                                Label::new(if requires_iv {
-                                    "128-bit IV / Counter required"
-                                } else {
-                                    "No IV used in ECB mode"
-                                })
-                                .text_color(theme.muted_foreground),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .children(CipherMode::ALL.into_iter().map(|mode| {
                                 toggle_button(
-                                    mode_button_id(mode),
-                                    mode.name(),
-                                    self.mode == mode,
+                                    "tab-trace",
+                                    "Trace",
+                                    self.active_tab == WorkspaceTab::Trace,
                                     false,
                                 )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.mode = mode;
-                                    this.set_status(format!("Mode set to {}", mode.name()), false);
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.active_tab = WorkspaceTab::Trace;
+                                    this.set_status("Switched to Step-by-Step Trace view", false);
                                     cx.notify();
-                                }))
-                            })),
+                                })),
+                            ),
                     ),
-            )
-            // Key Configuration Section
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .bg(theme.secondary)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(Label::new("Key").font_semibold())
-                                    .child(Label::new(key_len_text).text_color(theme.muted_foreground)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        toggle_button(
-                                            "key-fmt-utf8",
-                                            KeyFormat::Utf8.label(),
-                                            self.key_format == KeyFormat::Utf8,
-                                            false,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.key_format = KeyFormat::Utf8;
-                                            this.set_status("Key format set to UTF-8 (16 B)", false);
-                                            cx.notify();
-                                        })),
+            );
+
+        if self.active_tab != WorkspaceTab::Trace {
+            root = root
+                // Cipher Mode Bar
+                .child(
+                    v_flex()
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(8.0))
+                        .bg(theme.secondary)
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(Label::new("Cipher Mode").font_semibold())
+                                .child(
+                                    Label::new(if requires_iv {
+                                        "128-bit IV / Counter required"
+                                    } else {
+                                        "No IV used in ECB mode"
+                                    })
+                                    .text_color(theme.muted_foreground),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .children(CipherMode::ALL.into_iter().map(|mode| {
+                                    toggle_button(
+                                        mode_button_id(mode),
+                                        mode.name(),
+                                        self.mode == mode,
+                                        false,
                                     )
-                                    .child(
-                                        toggle_button(
-                                            "key-fmt-hex",
-                                            KeyFormat::Hex.label(),
-                                            self.key_format == KeyFormat::Hex,
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.mode = mode;
+                                        this.set_status(
+                                            format!("Mode set to {}", mode.name()),
                                             false,
+                                        );
+                                        cx.notify();
+                                    }))
+                                })),
+                        ),
+                )
+                // Key Configuration Section
+                .child(
+                    v_flex()
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(8.0))
+                        .bg(theme.secondary)
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(Label::new("Key").font_semibold())
+                                        .child(
+                                            Label::new(key_len_text)
+                                                .text_color(theme.muted_foreground),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            toggle_button(
+                                                "key-fmt-utf8",
+                                                KeyFormat::Utf8.label(),
+                                                self.key_format == KeyFormat::Utf8,
+                                                false,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.key_format = KeyFormat::Utf8;
+                                                this.set_status(
+                                                    "Key format set to UTF-8 (16 B)",
+                                                    false,
+                                                );
+                                                cx.notify();
+                                            })),
                                         )
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .child(
+                                            toggle_button(
+                                                "key-fmt-hex",
+                                                KeyFormat::Hex.label(),
+                                                self.key_format == KeyFormat::Hex,
+                                                false,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.key_format = KeyFormat::Hex;
+                                                this.set_status(
+                                                    "Key format set to Hex (32 chars)",
+                                                    false,
+                                                );
+                                                cx.notify();
+                                            })),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Input::new(&self.key_input)
+                                        .id("key-input")
+                                        .aria_label("AES-128 Key")
+                                        .flex_1(),
+                                )
+                                .child(
+                                    Button::new("btn-gen-key")
+                                        .outline()
+                                        .label("Random")
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.key_format = KeyFormat::Hex;
-                                            this.set_status("Key format set to Hex (32 chars)", false);
+                                            let hex = generate_random_hex_16();
+                                            this.key_input.update(cx, |state, cx| {
+                                                state.set_value(hex, window, cx)
+                                            });
+                                            this.set_status(
+                                                "Generated random 128-bit key (Hex)",
+                                                false,
+                                            );
                                             cx.notify();
                                         })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Input::new(&self.key_input)
-                                    .id("key-input")
-                                    .aria_label("AES-128 Key")
-                                    .flex_1(),
-                            )
-                            .child(
-                                Button::new("btn-gen-key")
-                                    .outline()
-                                    .label("Random")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.key_format = KeyFormat::Hex;
-                                        let hex = generate_random_hex_16();
-                                        this.key_input
-                                            .update(cx, |state, cx| state.set_value(hex, window, cx));
-                                        this.set_status("Generated random 128-bit key (Hex)", false);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            // IV / Counter Configuration Section
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded(px(8.0))
-                    .bg(theme.secondary)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .items_center()
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .items_center()
-                                    .child(
-                                        Label::new(if requires_iv {
-                                            "IV / Counter"
-                                        } else {
-                                            "IV / Counter (Not used in ECB mode)"
-                                        })
-                                        .font_semibold(),
-                                    )
-                                    .child(Label::new(iv_len_text).text_color(theme.muted_foreground)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        toggle_button(
-                                            "iv-fmt-hex",
-                                            KeyFormat::Hex.label(),
-                                            self.iv_format == KeyFormat::Hex,
-                                            !requires_iv,
+                                ),
+                        ),
+                )
+                // IV / Counter Configuration Section
+                .child(
+                    v_flex()
+                        .p_3()
+                        .gap_2()
+                        .rounded(px(8.0))
+                        .bg(theme.secondary)
+                        .border_1()
+                        .border_color(theme.border)
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .child(
+                                            Label::new(if requires_iv {
+                                                "IV / Counter"
+                                            } else {
+                                                "IV / Counter (Not used in ECB mode)"
+                                            })
+                                            .font_semibold(),
                                         )
-                                        .on_click(cx.listener(|this, _, _, cx| {
+                                        .child(
+                                            Label::new(iv_len_text)
+                                                .text_color(theme.muted_foreground),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .gap_2()
+                                        .child(
+                                            toggle_button(
+                                                "iv-fmt-hex",
+                                                KeyFormat::Hex.label(),
+                                                self.iv_format == KeyFormat::Hex,
+                                                !requires_iv,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.iv_format = KeyFormat::Hex;
+                                                this.set_status(
+                                                    "IV format set to Hex (32 chars)",
+                                                    false,
+                                                );
+                                                cx.notify();
+                                            })),
+                                        )
+                                        .child(
+                                            toggle_button(
+                                                "iv-fmt-utf8",
+                                                KeyFormat::Utf8.label(),
+                                                self.iv_format == KeyFormat::Utf8,
+                                                !requires_iv,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.iv_format = KeyFormat::Utf8;
+                                                this.set_status(
+                                                    "IV format set to UTF-8 (16 B)",
+                                                    false,
+                                                );
+                                                cx.notify();
+                                            })),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .child(
+                                    Input::new(&self.iv_input)
+                                        .id("iv-input")
+                                        .aria_label("Initialization Vector")
+                                        .disabled(!requires_iv)
+                                        .flex_1(),
+                                )
+                                .child(
+                                    Button::new("btn-gen-iv")
+                                        .outline()
+                                        .label("Random")
+                                        .disabled(!requires_iv)
+                                        .on_click(cx.listener(|this, _, window, cx| {
                                             this.iv_format = KeyFormat::Hex;
-                                            this.set_status("IV format set to Hex (32 chars)", false);
+                                            let hex = generate_random_hex_16();
+                                            this.iv_input.update(cx, |state, cx| {
+                                                state.set_value(hex, window, cx)
+                                            });
+                                            this.set_status(
+                                                "Generated random 128-bit IV (Hex)",
+                                                false,
+                                            );
                                             cx.notify();
                                         })),
-                                    )
-                                    .child(
-                                        toggle_button(
-                                            "iv-fmt-utf8",
-                                            KeyFormat::Utf8.label(),
-                                            self.iv_format == KeyFormat::Utf8,
-                                            !requires_iv,
-                                        )
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            this.iv_format = KeyFormat::Utf8;
-                                            this.set_status("IV format set to UTF-8 (16 B)", false);
-                                            cx.notify();
-                                        })),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Input::new(&self.iv_input)
-                                    .id("iv-input")
-                                    .aria_label("Initialization Vector")
-                                    .disabled(!requires_iv)
-                                    .flex_1(),
-                            )
-                            .child(
-                                Button::new("btn-gen-iv")
-                                    .outline()
-                                    .label("Random")
-                                    .disabled(!requires_iv)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.iv_format = KeyFormat::Hex;
-                                        let hex = generate_random_hex_16();
-                                        this.iv_input
-                                            .update(cx, |state, cx| state.set_value(hex, window, cx));
-                                        this.set_status("Generated random 128-bit IV (Hex)", false);
-                                        cx.notify();
-                                    })),
-                            ),
-                    ),
-            )
-            // Active Workspace (Text or File)
+                                ),
+                        ),
+                );
+        }
+
+        root
+            // Active Workspace (Text, File, or Trace)
             .child(workspace_content)
             // Status Bar
             .child(

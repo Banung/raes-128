@@ -72,6 +72,14 @@ fn output_text_value(window: &Window) -> String {
         .to_string()
 }
 
+fn trace_text_value(window: &Window) -> String {
+    window
+        .find_by_label("Step-by-Step Trace")
+        .value()
+        .expect("trace textarea should expose a value")
+        .to_string()
+}
+
 fn status_text(window: &Window) -> String {
     window
         .find("status-message")
@@ -298,4 +306,93 @@ fn shows_error_when_file_input_and_output_paths_match(cx: &mut TestAppContext) {
         );
     })
     .expect("run same-path error ui test");
+}
+
+#[gpui_kit::test]
+fn shows_step_by_step_trace_after_encrypt_and_toggles_all_rounds(cx: &mut TestAppContext) {
+    let handle = open_test_app(cx);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.click("key-input", cx);
+        window.input("0123456789abcdef", cx);
+
+        window.click("iv-input", cx);
+        window.input("000102030405060708090a0b0c0d0e0f", cx);
+
+        window.click("input-text", cx);
+        window.input("Hello RAES-128!", cx);
+
+        window.click("btn-encrypt", cx);
+        window.click("tab-trace", cx);
+
+        assert_eq!(status_text(window), "Switched to Step-by-Step Trace view");
+
+        let summary_trace = trace_text_value(window);
+        assert!(summary_trace.contains("AES-128-CBC"));
+        assert!(summary_trace.contains("Initial Round"));
+        assert!(summary_trace.contains("Round 1"));
+        assert!(summary_trace.contains("SubBytes"));
+        assert!(summary_trace.contains("ShiftRows"));
+        assert!(summary_trace.contains("MixColumns"));
+        assert!(summary_trace.contains("AddRoundKey"));
+        assert!(summary_trace.contains("Final Round"));
+        assert!(!summary_trace.contains("Round 5"));
+
+        window.click("trace-mode-all", cx);
+        let full_trace = trace_text_value(window);
+        assert!(full_trace.contains("Round 5"));
+        assert!(full_trace.contains("K5"));
+
+        window.click("trace-mode-summary", cx);
+        let back_to_summary = trace_text_value(window);
+        assert!(!back_to_summary.contains("Round 5"));
+    })
+    .expect("run trace encrypt and toggle ui test");
+}
+
+#[gpui_kit::test]
+fn captures_trace_for_decrypt_and_file_operations(cx: &mut TestAppContext) {
+    let dir = TempDirGuard::new("trace_file_ops");
+    let source_path = dir.path().join("trace_input.bin");
+    let enc_path = dir.path().join("trace_input.bin.enc");
+    std::fs::write(&source_path, b"Trace file payload!").expect("write source file");
+
+    let source_str = source_path.to_string_lossy().into_owned();
+    let enc_str = enc_path.to_string_lossy().into_owned();
+    let handle = open_test_app(cx);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.click("key-input", cx);
+        window.input("0123456789abcdef", cx);
+
+        window.click("iv-input", cx);
+        window.input("000102030405060708090a0b0c0d0e0f", cx);
+
+        window.click("input-text", cx);
+        window.input("Hello RAES-128!", cx);
+
+        window.click("btn-encrypt", cx);
+        window.click("btn-swap", cx);
+        window.click("btn-decrypt", cx);
+        window.click("tab-trace", cx);
+
+        let dec_trace = trace_text_value(window);
+        assert!(dec_trace.contains("Operation:             Decrypt"));
+        assert!(dec_trace.contains("InvSubBytes"));
+        assert!(dec_trace.contains("InvShiftRows"));
+        assert!(dec_trace.contains("InvMixColumns"));
+
+        window.click("tab-file", cx);
+        window.click("file-input-path", cx);
+        window.input(&source_str, cx);
+        window.click("file-output-path", cx);
+        window.input(&enc_str, cx);
+        window.click("btn-file-encrypt", cx);
+        window.click("tab-trace", cx);
+
+        let file_enc_trace = trace_text_value(window);
+        assert!(file_enc_trace.contains("Operation:             Encrypt"));
+        assert!(file_enc_trace.contains("SubBytes"));
+    })
+    .expect("run trace decrypt and file ui test");
 }
