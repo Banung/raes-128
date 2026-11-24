@@ -9,7 +9,11 @@ pub mod trace;
 
 pub use cipher::{Aes128, BLOCK_SIZE, KEY_SIZE};
 pub use encoding::{base64_decode, base64_encode, hex_decode, hex_encode};
-pub use modes::{CipherMode, decrypt, decrypt_with_trace, encrypt, encrypt_with_trace};
+pub use modes::{
+    CipherMode, PaddingMode, decrypt, decrypt_with_padding, decrypt_with_padding_and_trace,
+    decrypt_with_trace, encrypt, encrypt_with_padding, encrypt_with_padding_and_trace,
+    encrypt_with_trace,
+};
 pub use padding::{pkcs7_pad, pkcs7_unpad};
 pub use trace::{
     BlockTrace, FirstBlockModeTrace, RoundTrace, TraceDirection, TraceStep, format_state_matrix,
@@ -27,6 +31,8 @@ pub enum AesError {
     InvalidIvLength { expected: usize, actual: usize },
     /// Ciphertext length is not a valid multiple of the 16-byte block size.
     InvalidCiphertextLength { actual: usize },
+    /// Plaintext length is not a non-zero multiple of the 16-byte block size when padding is None.
+    InvalidPlaintextLength { actual: usize },
     /// Decrypted plaintext failed PKCS#7 padding validation.
     InvalidPadding,
     /// Input was not valid hexadecimal text.
@@ -49,6 +55,12 @@ impl std::fmt::Display for AesError {
                 write!(
                     f,
                     "invalid ciphertext length: {actual} bytes is not a non-zero multiple of 16"
+                )
+            }
+            Self::InvalidPlaintextLength { actual } => {
+                write!(
+                    f,
+                    "invalid plaintext length: {actual} bytes is not a non-zero multiple of 16 (required when padding is None)"
                 )
             }
             Self::InvalidPadding => write!(f, "invalid PKCS#7 padding"),

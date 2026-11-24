@@ -13,9 +13,10 @@ use gpui_kit::component::{
     v_flex,
 };
 
-use crate::aes::{CipherMode, FirstBlockModeTrace, format_trace_text};
+use crate::aes::{CipherMode, FirstBlockModeTrace, PaddingMode, format_trace_text};
 use crate::ui::controller::{
-    CiphertextFormat, CryptoRequest, KeyFormat, generate_random_hex_16, run_decrypt, run_encrypt,
+    CiphertextFormat, CryptoRequest, KeyFormat, PlaintextFormat, generate_random_hex_16,
+    run_decrypt, run_encrypt,
 };
 use crate::ui::file_crypto::{
     FileCryptoRequest, decrypt_file, encrypt_file, suggested_output_path,
@@ -121,10 +122,12 @@ impl RaesApp {
 
         let req = CryptoRequest {
             mode: self.mode,
+            padding: PaddingMode::Pkcs7,
             key_format: self.key_format,
             key_text: key_text.as_ref(),
             iv_format: self.iv_format,
             iv_text: iv_text.as_ref(),
+            plaintext_format: PlaintextFormat::Utf8,
             ciphertext_format: self.ciphertext_format,
             input_text: input_text.as_ref(),
         };
