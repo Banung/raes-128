@@ -5,11 +5,16 @@ pub mod encoding;
 pub mod modes;
 pub mod padding;
 mod tables;
+pub mod trace;
 
 pub use cipher::{Aes128, BLOCK_SIZE, KEY_SIZE};
 pub use encoding::{base64_decode, base64_encode, hex_decode, hex_encode};
-pub use modes::{CipherMode, decrypt, encrypt};
+pub use modes::{CipherMode, decrypt, decrypt_with_trace, encrypt, encrypt_with_trace};
 pub use padding::{pkcs7_pad, pkcs7_unpad};
+pub use trace::{
+    BlockTrace, FirstBlockModeTrace, RoundTrace, TraceDirection, TraceStep, format_state_matrix,
+    format_trace_text,
+};
 
 /// Errors returned by AES-128 key, block, mode, padding, and encoding operations.
 #[derive(Debug, Clone, PartialEq, Eq)]

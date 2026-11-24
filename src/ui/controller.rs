@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aes::{
-    AesError, BLOCK_SIZE, CipherMode, base64_decode, base64_encode, decrypt, encrypt, hex_decode,
-    hex_encode,
+    AesError, BLOCK_SIZE, CipherMode, FirstBlockModeTrace, base64_decode, base64_encode,
+    decrypt_with_trace, encrypt_with_trace, hex_decode, hex_encode,
 };
 
 /// Input representation for 16-byte AES-128 keys and initialization vectors.
@@ -63,6 +63,7 @@ pub struct CryptoSuccess {
     pub input_bytes: usize,
     pub output_bytes: usize,
     pub utf8_fallback_hex: bool,
+    pub trace: Option<FirstBlockModeTrace>,
 }
 
 /// Parses a 16-byte key or initialization vector according to `format`.
@@ -129,7 +130,7 @@ fn parse_key_and_iv(req: &CryptoRequest<'_>) -> Result<([u8; 16], Option<[u8; 16
 /// Validates inputs, encrypts UTF-8 `input_text`, and formats the resulting ciphertext.
 pub fn run_encrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
     let (key, iv) = parse_key_and_iv(req)?;
-    let ciphertext = encrypt(
+    let (ciphertext, trace) = encrypt_with_trace(
         req.mode,
         &key,
         iv.as_ref().map(|b| b.as_slice()),
@@ -145,6 +146,7 @@ pub fn run_encrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
         input_bytes: req.input_text.len(),
         output_bytes: ciphertext.len(),
         utf8_fallback_hex: false,
+        trace,
     })
 }
 
@@ -156,7 +158,7 @@ pub fn run_decrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
         CiphertextFormat::Base64 => base64_decode(req.input_text)?,
     };
     let input_bytes = ciphertext.len();
-    let plaintext = decrypt(
+    let (plaintext, trace) = decrypt_with_trace(
         req.mode,
         &key,
         iv.as_ref().map(|b| b.as_slice()),
@@ -174,6 +176,7 @@ pub fn run_decrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
         input_bytes,
         output_bytes,
         utf8_fallback_hex,
+        trace,
     })
 }
 
@@ -217,6 +220,7 @@ pub fn generate_random_hex_16() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::aes::encrypt;
 
     const UTF8_KEY: &str = "0123456789abcdef";
     const HEX_KEY: &str = "000102030405060708090a0b0c0d0e0f";

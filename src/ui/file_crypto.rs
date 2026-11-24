@@ -6,7 +6,9 @@ use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::aes::{AesError, CipherMode, decrypt, encrypt};
+use crate::aes::{
+    AesError, CipherMode, FirstBlockModeTrace, decrypt_with_trace, encrypt_with_trace,
+};
 
 use super::controller::{KeyFormat, parse_key_and_iv_fields};
 
@@ -105,13 +107,14 @@ pub struct FileCryptoRequest<'a> {
     pub output_path: &'a Path,
 }
 
-/// Output paths and byte counts returned by [`encrypt_file`] and [`decrypt_file`].
+/// Output paths, byte counts, and optional block-0 trace returned by [`encrypt_file`] and [`decrypt_file`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCryptoSuccess {
     pub input_path: PathBuf,
     pub output_path: PathBuf,
     pub input_bytes: usize,
     pub output_bytes: usize,
+    pub trace: Option<FirstBlockModeTrace>,
 }
 
 /// Computes a default output path in the same directory as `input` for encrypt or decrypt.
@@ -140,17 +143,22 @@ pub fn suggested_output_path(input: &Path, encrypt_op: bool) -> PathBuf {
 
 /// Validates paths, key/IV, and file metadata, then encrypts `input_path` to `output_path`.
 pub fn encrypt_file(req: &FileCryptoRequest<'_>) -> Result<FileCryptoSuccess, FileCryptoError> {
-    process_file(req, encrypt)
+    process_file(req, encrypt_with_trace)
 }
 
 /// Validates paths, key/IV, and file metadata, then decrypts `input_path` to `output_path`.
 pub fn decrypt_file(req: &FileCryptoRequest<'_>) -> Result<FileCryptoSuccess, FileCryptoError> {
-    process_file(req, decrypt)
+    process_file(req, decrypt_with_trace)
 }
 
 fn process_file(
     req: &FileCryptoRequest<'_>,
-    cipher_op: fn(CipherMode, &[u8], Option<&[u8]>, &[u8]) -> Result<Vec<u8>, AesError>,
+    cipher_op: fn(
+        CipherMode,
+        &[u8],
+        Option<&[u8]>,
+        &[u8],
+    ) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError>,
 ) -> Result<FileCryptoSuccess, FileCryptoError> {
     validate_paths_and_metadata(req.input_path, req.output_path)?;
 
@@ -164,7 +172,7 @@ fn process_file(
 
     let input_bytes = read_regular_file_bounded(req.input_path, MAX_FILE_SIZE_BYTES)?;
 
-    let output_bytes = cipher_op(
+    let (output_bytes, trace) = cipher_op(
         req.mode,
         &key,
         iv.as_ref().map(|bytes| bytes.as_slice()),
@@ -178,6 +186,7 @@ fn process_file(
         output_path: req.output_path.to_path_buf(),
         input_bytes: input_bytes.len(),
         output_bytes: output_bytes.len(),
+        trace,
     })
 }
 

@@ -2,6 +2,7 @@
 
 use super::AesError;
 use super::tables::{INV_SBOX, RCON, SBOX, gf_mul};
+use super::trace::{BlockTrace, RoundTrace, TraceDirection, TraceStep};
 
 /// AES block size in bytes (128 bits).
 pub const BLOCK_SIZE: usize = 16;
@@ -34,39 +35,255 @@ impl Aes128 {
         Ok(Self::new(key_bytes))
     }
 
+    /// Returns the 11 expanded 128-bit round keys (`K0..=K10`).
+    pub fn round_keys(&self) -> &[[u8; BLOCK_SIZE]; 11] {
+        &self.round_keys
+    }
+
     /// Encrypts a single 16-byte block using AES-128 (FIPS 197 Section 5.1).
     pub fn encrypt_block(&self, block: [u8; BLOCK_SIZE]) -> [u8; BLOCK_SIZE] {
-        let mut state = block;
-        add_round_key(&mut state, &self.round_keys[0]);
+        self.encrypt_block_inner(block, None)
+    }
 
-        for round in 1..NUM_ROUNDS {
-            sub_bytes(&mut state);
-            shift_rows(&mut state);
-            mix_columns(&mut state);
-            add_round_key(&mut state, &self.round_keys[round]);
-        }
-
-        sub_bytes(&mut state);
-        shift_rows(&mut state);
-        add_round_key(&mut state, &self.round_keys[NUM_ROUNDS]);
-        state
+    /// Encrypts a single 16-byte block and records all 11 rounds (`0..=10`) in a [`BlockTrace`].
+    pub fn encrypt_block_with_trace(&self, block: [u8; BLOCK_SIZE]) -> ([u8; BLOCK_SIZE], BlockTrace) {
+        let mut rounds = Vec::with_capacity(NUM_ROUNDS + 1);
+        let output = self.encrypt_block_inner(block, Some(&mut rounds));
+        let trace = BlockTrace {
+            direction: TraceDirection::Encrypt,
+            cipher_input: block,
+            cipher_output: output,
+            round_keys: self.round_keys,
+            rounds,
+        };
+        (output, trace)
     }
 
     /// Decrypts a single 16-byte block using AES-128 (FIPS 197 Section 5.3).
     pub fn decrypt_block(&self, block: [u8; BLOCK_SIZE]) -> [u8; BLOCK_SIZE] {
-        let mut state = block;
-        add_round_key(&mut state, &self.round_keys[NUM_ROUNDS]);
+        self.decrypt_block_inner(block, None)
+    }
 
-        for round in (1..NUM_ROUNDS).rev() {
-            inv_shift_rows(&mut state);
-            inv_sub_bytes(&mut state);
-            add_round_key(&mut state, &self.round_keys[round]);
-            inv_mix_columns(&mut state);
+    /// Decrypts a single 16-byte block and records all 11 rounds (`0..=10`) in a [`BlockTrace`].
+    pub fn decrypt_block_with_trace(&self, block: [u8; BLOCK_SIZE]) -> ([u8; BLOCK_SIZE], BlockTrace) {
+        let mut rounds = Vec::with_capacity(NUM_ROUNDS + 1);
+        let output = self.decrypt_block_inner(block, Some(&mut rounds));
+        let trace = BlockTrace {
+            direction: TraceDirection::Decrypt,
+            cipher_input: block,
+            cipher_output: output,
+            round_keys: self.round_keys,
+            rounds,
+        };
+        (output, trace)
+    }
+
+    fn encrypt_block_inner(
+        &self,
+        block: [u8; BLOCK_SIZE],
+        mut rounds: Option<&mut Vec<RoundTrace>>,
+    ) -> [u8; BLOCK_SIZE] {
+        let mut state = block;
+        add_round_key(&mut state, &self.round_keys[0]);
+        if let Some(ref mut r) = rounds {
+            r.push(RoundTrace {
+                title: "Initial Round (Round 0)".to_string(),
+                round_index: 0,
+                steps: vec![TraceStep {
+                    name: "AddRoundKey",
+                    state,
+                    round_key: Some(self.round_keys[0]),
+                }],
+            });
         }
 
+        for round in 1..NUM_ROUNDS {
+            let mut steps = rounds.as_ref().map(|_| Vec::with_capacity(4));
+
+            sub_bytes(&mut state);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "SubBytes",
+                    state,
+                    round_key: None,
+                });
+            }
+
+            shift_rows(&mut state);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "ShiftRows",
+                    state,
+                    round_key: None,
+                });
+            }
+
+            mix_columns(&mut state);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "MixColumns",
+                    state,
+                    round_key: None,
+                });
+            }
+
+            add_round_key(&mut state, &self.round_keys[round]);
+            if let Some(mut s) = steps {
+                s.push(TraceStep {
+                    name: "AddRoundKey",
+                    state,
+                    round_key: Some(self.round_keys[round]),
+                });
+                if let Some(ref mut r) = rounds {
+                    r.push(RoundTrace {
+                        title: format!("Round {round}"),
+                        round_index: round,
+                        steps: s,
+                    });
+                }
+            }
+        }
+
+        let mut final_steps = rounds.as_ref().map(|_| Vec::with_capacity(3));
+        sub_bytes(&mut state);
+        if let Some(ref mut s) = final_steps {
+            s.push(TraceStep {
+                name: "SubBytes",
+                state,
+                round_key: None,
+            });
+        }
+
+        shift_rows(&mut state);
+        if let Some(ref mut s) = final_steps {
+            s.push(TraceStep {
+                name: "ShiftRows",
+                state,
+                round_key: None,
+            });
+        }
+
+        add_round_key(&mut state, &self.round_keys[NUM_ROUNDS]);
+        if let Some(mut s) = final_steps {
+            s.push(TraceStep {
+                name: "AddRoundKey",
+                state,
+                round_key: Some(self.round_keys[NUM_ROUNDS]),
+            });
+            if let Some(ref mut r) = rounds {
+                r.push(RoundTrace {
+                    title: "Final Round (Round 10)".to_string(),
+                    round_index: NUM_ROUNDS,
+                    steps: s,
+                });
+            }
+        }
+
+        state
+    }
+
+    fn decrypt_block_inner(
+        &self,
+        block: [u8; BLOCK_SIZE],
+        mut rounds: Option<&mut Vec<RoundTrace>>,
+    ) -> [u8; BLOCK_SIZE] {
+        let mut state = block;
+        add_round_key(&mut state, &self.round_keys[NUM_ROUNDS]);
+        if let Some(ref mut r) = rounds {
+            r.push(RoundTrace {
+                title: "Initial Round (Round 0 / Key K10)".to_string(),
+                round_index: 0,
+                steps: vec![TraceStep {
+                    name: "AddRoundKey",
+                    state,
+                    round_key: Some(self.round_keys[NUM_ROUNDS]),
+                }],
+            });
+        }
+
+        for step in 1..NUM_ROUNDS {
+            let key_idx = NUM_ROUNDS - step;
+            let mut steps = rounds.as_ref().map(|_| Vec::with_capacity(4));
+
+            inv_shift_rows(&mut state);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "InvShiftRows",
+                    state,
+                    round_key: None,
+                });
+            }
+
+            inv_sub_bytes(&mut state);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "InvSubBytes",
+                    state,
+                    round_key: None,
+                });
+            }
+
+            add_round_key(&mut state, &self.round_keys[key_idx]);
+            if let Some(ref mut s) = steps {
+                s.push(TraceStep {
+                    name: "AddRoundKey",
+                    state,
+                    round_key: Some(self.round_keys[key_idx]),
+                });
+            }
+
+            inv_mix_columns(&mut state);
+            if let Some(mut s) = steps {
+                s.push(TraceStep {
+                    name: "InvMixColumns",
+                    state,
+                    round_key: None,
+                });
+                if let Some(ref mut r) = rounds {
+                    r.push(RoundTrace {
+                        title: format!("Round {step} (Key K{key_idx})"),
+                        round_index: step,
+                        steps: s,
+                    });
+                }
+            }
+        }
+
+        let mut final_steps = rounds.as_ref().map(|_| Vec::with_capacity(3));
         inv_shift_rows(&mut state);
+        if let Some(ref mut s) = final_steps {
+            s.push(TraceStep {
+                name: "InvShiftRows",
+                state,
+                round_key: None,
+            });
+        }
+
         inv_sub_bytes(&mut state);
+        if let Some(ref mut s) = final_steps {
+            s.push(TraceStep {
+                name: "InvSubBytes",
+                state,
+                round_key: None,
+            });
+        }
+
         add_round_key(&mut state, &self.round_keys[0]);
+        if let Some(mut s) = final_steps {
+            s.push(TraceStep {
+                name: "AddRoundKey",
+                state,
+                round_key: Some(self.round_keys[0]),
+            });
+            if let Some(ref mut r) = rounds {
+                r.push(RoundTrace {
+                    title: "Final Round (Round 10 / Key K0)".to_string(),
+                    round_index: NUM_ROUNDS,
+                    steps: s,
+                });
+            }
+        }
+
         state
     }
 }

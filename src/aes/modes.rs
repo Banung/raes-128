@@ -3,6 +3,7 @@
 use super::AesError;
 use super::cipher::{Aes128, BLOCK_SIZE};
 use super::padding::{pkcs7_pad, pkcs7_unpad};
+use super::trace::{BlockTrace, FirstBlockModeTrace, TraceDirection};
 
 /// Supported AES-128 modes of operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,16 +55,17 @@ pub fn encrypt(
     iv: Option<&[u8]>,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, AesError> {
-    let cipher = Aes128::from_slice(key)?;
+    encrypt_inner(mode, key, iv, plaintext, false).map(|(out, _)| out)
+}
 
-    match mode {
-        CipherMode::Ecb => Ok(encrypt_ecb(&cipher, plaintext)),
-        CipherMode::Cbc => Ok(encrypt_cbc(&cipher, require_iv(iv)?, plaintext)),
-        CipherMode::Pcbc => Ok(encrypt_pcbc(&cipher, require_iv(iv)?, plaintext)),
-        CipherMode::Cfb => Ok(encrypt_cfb(&cipher, require_iv(iv)?, plaintext)),
-        CipherMode::Ofb => Ok(apply_ofb(&cipher, require_iv(iv)?, plaintext)),
-        CipherMode::Ctr => Ok(apply_ctr(&cipher, require_iv(iv)?, plaintext)),
-    }
+/// Encrypts `plaintext` with AES-128 under `mode` and captures a first-block trace.
+pub fn encrypt_with_trace(
+    mode: CipherMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
+    encrypt_inner(mode, key, iv, plaintext, true)
 }
 
 /// Decrypts `ciphertext` with AES-128 under the specified [`CipherMode`].
@@ -76,16 +78,260 @@ pub fn decrypt(
     iv: Option<&[u8]>,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, AesError> {
+    decrypt_inner(mode, key, iv, ciphertext, false).map(|(out, _)| out)
+}
+
+/// Decrypts `ciphertext` with AES-128 under `mode` and captures a first-block trace.
+pub fn decrypt_with_trace(
+    mode: CipherMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
+    decrypt_inner(mode, key, iv, ciphertext, true)
+}
+
+fn encrypt_inner(
+    mode: CipherMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    plaintext: &[u8],
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
     let cipher = Aes128::from_slice(key)?;
 
     match mode {
-        CipherMode::Ecb => decrypt_ecb(&cipher, ciphertext),
-        CipherMode::Cbc => decrypt_cbc(&cipher, require_iv(iv)?, ciphertext),
-        CipherMode::Pcbc => decrypt_pcbc(&cipher, require_iv(iv)?, ciphertext),
-        CipherMode::Cfb => Ok(decrypt_cfb(&cipher, require_iv(iv)?, ciphertext)),
-        CipherMode::Ofb => Ok(apply_ofb(&cipher, require_iv(iv)?, ciphertext)),
-        CipherMode::Ctr => Ok(apply_ctr(&cipher, require_iv(iv)?, ciphertext)),
+        CipherMode::Ecb => {
+            let (out, bt) = encrypt_ecb(&cipher, plaintext, capture_trace);
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Encrypt,
+                note: "ECB encrypts PKCS#7-padded block 0 directly without an IV (C0 = E_K(P0))."
+                    .to_string(),
+                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
+                    [..BLOCK_SIZE]
+                    .to_vec(),
+                iv: None,
+                result_block: out[..BLOCK_SIZE].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Cbc => {
+            let iv_arr = require_iv(iv)?;
+            let (out, bt) = encrypt_cbc(&cipher, iv_arr, plaintext, capture_trace);
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Encrypt,
+                note: "CBC XORs PKCS#7-padded block 0 with IV before AES encryption (C0 = E_K(P0 XOR IV))."
+                    .to_string(),
+                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
+                    [..BLOCK_SIZE]
+                    .to_vec(),
+                iv: Some(iv_arr),
+                result_block: out[..BLOCK_SIZE].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Pcbc => {
+            let iv_arr = require_iv(iv)?;
+            let (out, bt) = encrypt_pcbc(&cipher, iv_arr, plaintext, capture_trace);
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Encrypt,
+                note: "PCBC XORs block 0 with IV (C0 = E_K(P0 XOR IV)) and propagates P_i XOR C_i to subsequent blocks."
+                    .to_string(),
+                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
+                    [..BLOCK_SIZE]
+                    .to_vec(),
+                iv: Some(iv_arr),
+                result_block: out[..BLOCK_SIZE].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Cfb => {
+            let iv_arr = require_iv(iv)?;
+            if plaintext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = encrypt_cfb(&cipher, iv_arr, plaintext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Encrypt,
+                "CFB encrypts IV via AES-Encrypt to produce Keystream0, then XORs block 0 with Keystream0 (C0 = P0 XOR E_K(IV)).",
+                plaintext,
+                iv_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
+        CipherMode::Ofb => {
+            let iv_arr = require_iv(iv)?;
+            if plaintext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = apply_ofb(&cipher, iv_arr, plaintext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Encrypt,
+                "OFB encrypts IV via AES-Encrypt to produce Keystream0, then XORs block 0 with Keystream0 (C0 = P0 XOR E_K(IV)).",
+                plaintext,
+                iv_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
+        CipherMode::Ctr => {
+            let counter_arr = require_iv(iv)?;
+            if plaintext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = apply_ctr(&cipher, counter_arr, plaintext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Encrypt,
+                "CTR encrypts Counter0 via AES-Encrypt to produce Keystream0, then XORs block 0 with Keystream0 (C0 = P0 XOR E_K(Counter0)).",
+                plaintext,
+                counter_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
     }
+}
+
+fn decrypt_inner(
+    mode: CipherMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    ciphertext: &[u8],
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
+    let cipher = Aes128::from_slice(key)?;
+
+    match mode {
+        CipherMode::Ecb => {
+            let (out, bt) = decrypt_ecb(&cipher, ciphertext, capture_trace)?;
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Decrypt,
+                note: "ECB decrypts ciphertext block 0 directly without an IV (P0 = D_K(C0))."
+                    .to_string(),
+                source_block: ciphertext[..BLOCK_SIZE].to_vec(),
+                iv: None,
+                result_block: out[..out.len().min(BLOCK_SIZE)].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Cbc => {
+            let iv_arr = require_iv(iv)?;
+            let (out, bt) = decrypt_cbc(&cipher, iv_arr, ciphertext, capture_trace)?;
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Decrypt,
+                note: "CBC decrypts C0 with AES then XORs with IV to recover block 0 (P0 = D_K(C0) XOR IV)."
+                    .to_string(),
+                source_block: ciphertext[..BLOCK_SIZE].to_vec(),
+                iv: Some(iv_arr),
+                result_block: out[..out.len().min(BLOCK_SIZE)].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Pcbc => {
+            let iv_arr = require_iv(iv)?;
+            let (out, bt) = decrypt_pcbc(&cipher, iv_arr, ciphertext, capture_trace)?;
+            let trace = bt.map(|block_trace| FirstBlockModeTrace {
+                mode,
+                operation: TraceDirection::Decrypt,
+                note: "PCBC decrypts C0 then XORs with IV (P0 = D_K(C0) XOR IV) and propagates P_i XOR C_i to subsequent blocks."
+                    .to_string(),
+                source_block: ciphertext[..BLOCK_SIZE].to_vec(),
+                iv: Some(iv_arr),
+                result_block: out[..out.len().min(BLOCK_SIZE)].to_vec(),
+                block_trace,
+            });
+            Ok((out, trace))
+        }
+        CipherMode::Cfb => {
+            let iv_arr = require_iv(iv)?;
+            if ciphertext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = decrypt_cfb(&cipher, iv_arr, ciphertext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Decrypt,
+                "CFB decrypts by encrypting IV via AES-Encrypt to produce Keystream0, then XORing ciphertext block 0 with Keystream0 (P0 = C0 XOR E_K(IV)).",
+                ciphertext,
+                iv_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
+        CipherMode::Ofb => {
+            let iv_arr = require_iv(iv)?;
+            if ciphertext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = apply_ofb(&cipher, iv_arr, ciphertext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Decrypt,
+                "OFB decrypts by encrypting IV via AES-Encrypt to produce Keystream0, then XORing ciphertext block 0 with Keystream0 (P0 = C0 XOR E_K(IV)).",
+                ciphertext,
+                iv_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
+        CipherMode::Ctr => {
+            let counter_arr = require_iv(iv)?;
+            if ciphertext.is_empty() {
+                return Ok((Vec::new(), None));
+            }
+            let (out, bt) = apply_ctr(&cipher, counter_arr, ciphertext, capture_trace);
+            let trace = stream_mode_trace(
+                mode,
+                TraceDirection::Decrypt,
+                "CTR decrypts by encrypting Counter0 via AES-Encrypt to produce Keystream0, then XORing ciphertext block 0 with Keystream0 (P0 = C0 XOR E_K(Counter0)).",
+                ciphertext,
+                counter_arr,
+                &out,
+                bt,
+            );
+            Ok((out, trace))
+        }
+    }
+}
+
+fn stream_mode_trace(
+    mode: CipherMode,
+    operation: TraceDirection,
+    note: &str,
+    input: &[u8],
+    iv: [u8; BLOCK_SIZE],
+    output: &[u8],
+    block_trace: Option<BlockTrace>,
+) -> Option<FirstBlockModeTrace> {
+    let first_len = input.len().min(BLOCK_SIZE);
+    block_trace.map(|bt| FirstBlockModeTrace {
+        mode,
+        operation,
+        note: note.to_string(),
+        source_block: input[..first_len].to_vec(),
+        iv: Some(iv),
+        result_block: output[..first_len].to_vec(),
+        block_trace: bt,
+    })
 }
 
 fn require_iv(iv: Option<&[u8]>) -> Result<[u8; BLOCK_SIZE], AesError> {
@@ -125,147 +371,251 @@ fn xor_stream_chunk(input: &[u8], keystream: &[u8; BLOCK_SIZE], out: &mut Vec<u8
     }
 }
 
-fn encrypt_ecb(cipher: &Aes128, plaintext: &[u8]) -> Vec<u8> {
+fn encrypt_block_maybe_trace(
+    cipher: &Aes128,
+    block: [u8; BLOCK_SIZE],
+    capture: bool,
+    trace_slot: &mut Option<BlockTrace>,
+) -> [u8; BLOCK_SIZE] {
+    if capture && trace_slot.is_none() {
+        let (out, bt) = cipher.encrypt_block_with_trace(block);
+        *trace_slot = Some(bt);
+        out
+    } else {
+        cipher.encrypt_block(block)
+    }
+}
+
+fn decrypt_block_maybe_trace(
+    cipher: &Aes128,
+    block: [u8; BLOCK_SIZE],
+    capture: bool,
+    trace_slot: &mut Option<BlockTrace>,
+) -> [u8; BLOCK_SIZE] {
+    if capture && trace_slot.is_none() {
+        let (out, bt) = cipher.decrypt_block_with_trace(block);
+        *trace_slot = Some(bt);
+        out
+    } else {
+        cipher.decrypt_block(block)
+    }
+}
+
+fn encrypt_ecb(
+    cipher: &Aes128,
+    plaintext: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let padded = pkcs7_pad(plaintext);
     let mut out = Vec::with_capacity(padded.len());
+    let mut trace = None;
     for chunk in padded.chunks_exact(BLOCK_SIZE) {
-        out.extend_from_slice(&cipher.encrypt_block(to_block(chunk)));
+        let encrypted =
+            encrypt_block_maybe_trace(cipher, to_block(chunk), capture_trace, &mut trace);
+        out.extend_from_slice(&encrypted);
     }
-    out
+    (out, trace)
 }
 
-fn decrypt_ecb(cipher: &Aes128, ciphertext: &[u8]) -> Result<Vec<u8>, AesError> {
+fn decrypt_ecb(
+    cipher: &Aes128,
+    ciphertext: &[u8],
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
     let mut padded = Vec::with_capacity(ciphertext.len());
+    let mut trace = None;
     for chunk in ciphertext.chunks_exact(BLOCK_SIZE) {
-        padded.extend_from_slice(&cipher.decrypt_block(to_block(chunk)));
+        let decrypted =
+            decrypt_block_maybe_trace(cipher, to_block(chunk), capture_trace, &mut trace);
+        padded.extend_from_slice(&decrypted);
     }
-    pkcs7_unpad(&padded)
+    let unpadded = pkcs7_unpad(&padded)?;
+    Ok((unpadded, trace))
 }
 
-fn encrypt_cbc(cipher: &Aes128, iv: [u8; BLOCK_SIZE], plaintext: &[u8]) -> Vec<u8> {
+fn encrypt_cbc(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    plaintext: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let padded = pkcs7_pad(plaintext);
     let mut out = Vec::with_capacity(padded.len());
     let mut prev = iv;
+    let mut trace = None;
 
     for chunk in padded.chunks_exact(BLOCK_SIZE) {
         let block = xor_block(to_block(chunk), prev);
-        let encrypted = cipher.encrypt_block(block);
+        let encrypted = encrypt_block_maybe_trace(cipher, block, capture_trace, &mut trace);
         out.extend_from_slice(&encrypted);
         prev = encrypted;
     }
-    out
+    (out, trace)
 }
 
 fn decrypt_cbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
     ciphertext: &[u8],
-) -> Result<Vec<u8>, AesError> {
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
     let mut padded = Vec::with_capacity(ciphertext.len());
     let mut prev = iv;
+    let mut trace = None;
 
     for chunk in ciphertext.chunks_exact(BLOCK_SIZE) {
         let c = to_block(chunk);
-        let p = xor_block(cipher.decrypt_block(c), prev);
+        let decrypted = decrypt_block_maybe_trace(cipher, c, capture_trace, &mut trace);
+        let p = xor_block(decrypted, prev);
         padded.extend_from_slice(&p);
         prev = c;
     }
-    pkcs7_unpad(&padded)
+    let unpadded = pkcs7_unpad(&padded)?;
+    Ok((unpadded, trace))
 }
 
-fn encrypt_pcbc(cipher: &Aes128, iv: [u8; BLOCK_SIZE], plaintext: &[u8]) -> Vec<u8> {
+fn encrypt_pcbc(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    plaintext: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let padded = pkcs7_pad(plaintext);
     let mut out = Vec::with_capacity(padded.len());
     let mut prev_mask = iv;
+    let mut trace = None;
 
     for chunk in padded.chunks_exact(BLOCK_SIZE) {
         let p = to_block(chunk);
-        let c = cipher.encrypt_block(xor_block(p, prev_mask));
+        let c = encrypt_block_maybe_trace(
+            cipher,
+            xor_block(p, prev_mask),
+            capture_trace,
+            &mut trace,
+        );
         out.extend_from_slice(&c);
         prev_mask = xor_block(p, c);
     }
-    out
+    (out, trace)
 }
 
+#[cfg(test)]
 fn decrypt_pcbc_raw(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, AesError> {
+    decrypt_pcbc_raw_inner(cipher, iv, ciphertext, false).map(|(padded, _)| padded)
+}
+
+fn decrypt_pcbc_raw_inner(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    ciphertext: &[u8],
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
     let mut padded = Vec::with_capacity(ciphertext.len());
     let mut prev_mask = iv;
+    let mut trace = None;
 
     for chunk in ciphertext.chunks_exact(BLOCK_SIZE) {
         let c = to_block(chunk);
-        let p = xor_block(cipher.decrypt_block(c), prev_mask);
+        let decrypted = decrypt_block_maybe_trace(cipher, c, capture_trace, &mut trace);
+        let p = xor_block(decrypted, prev_mask);
         padded.extend_from_slice(&p);
         prev_mask = xor_block(p, c);
     }
-    Ok(padded)
+    Ok((padded, trace))
 }
 
 fn decrypt_pcbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
     ciphertext: &[u8],
-) -> Result<Vec<u8>, AesError> {
-    let padded = decrypt_pcbc_raw(cipher, iv, ciphertext)?;
-    pkcs7_unpad(&padded)
+    capture_trace: bool,
+) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
+    let (padded, trace) = decrypt_pcbc_raw_inner(cipher, iv, ciphertext, capture_trace)?;
+    let unpadded = pkcs7_unpad(&padded)?;
+    Ok((unpadded, trace))
 }
 
-fn encrypt_cfb(cipher: &Aes128, iv: [u8; BLOCK_SIZE], plaintext: &[u8]) -> Vec<u8> {
+fn encrypt_cfb(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    plaintext: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let mut out = Vec::with_capacity(plaintext.len());
     let mut feedback = iv;
+    let mut trace = None;
 
     for chunk in plaintext.chunks(BLOCK_SIZE) {
-        let keystream = cipher.encrypt_block(feedback);
+        let keystream = encrypt_block_maybe_trace(cipher, feedback, capture_trace, &mut trace);
         let start = out.len();
         xor_stream_chunk(chunk, &keystream, &mut out);
         if chunk.len() == BLOCK_SIZE {
             feedback.copy_from_slice(&out[start..]);
         }
     }
-    out
+    (out, trace)
 }
 
-fn decrypt_cfb(cipher: &Aes128, iv: [u8; BLOCK_SIZE], ciphertext: &[u8]) -> Vec<u8> {
+fn decrypt_cfb(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    ciphertext: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let mut out = Vec::with_capacity(ciphertext.len());
     let mut feedback = iv;
+    let mut trace = None;
 
     for chunk in ciphertext.chunks(BLOCK_SIZE) {
-        let keystream = cipher.encrypt_block(feedback);
+        let keystream = encrypt_block_maybe_trace(cipher, feedback, capture_trace, &mut trace);
         xor_stream_chunk(chunk, &keystream, &mut out);
         if chunk.len() == BLOCK_SIZE {
             feedback.copy_from_slice(chunk);
         }
     }
-    out
+    (out, trace)
 }
 
-fn apply_ofb(cipher: &Aes128, iv: [u8; BLOCK_SIZE], input: &[u8]) -> Vec<u8> {
+fn apply_ofb(
+    cipher: &Aes128,
+    iv: [u8; BLOCK_SIZE],
+    input: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let mut out = Vec::with_capacity(input.len());
     let mut feedback = iv;
+    let mut trace = None;
 
     for chunk in input.chunks(BLOCK_SIZE) {
-        feedback = cipher.encrypt_block(feedback);
+        feedback = encrypt_block_maybe_trace(cipher, feedback, capture_trace, &mut trace);
         xor_stream_chunk(chunk, &feedback, &mut out);
     }
-    out
+    (out, trace)
 }
 
-fn apply_ctr(cipher: &Aes128, initial_counter: [u8; BLOCK_SIZE], input: &[u8]) -> Vec<u8> {
+fn apply_ctr(
+    cipher: &Aes128,
+    initial_counter: [u8; BLOCK_SIZE],
+    input: &[u8],
+    capture_trace: bool,
+) -> (Vec<u8>, Option<BlockTrace>) {
     let mut out = Vec::with_capacity(input.len());
     let mut counter = initial_counter;
+    let mut trace = None;
 
     for chunk in input.chunks(BLOCK_SIZE) {
-        let keystream = cipher.encrypt_block(counter);
+        let keystream = encrypt_block_maybe_trace(cipher, counter, capture_trace, &mut trace);
         xor_stream_chunk(chunk, &keystream, &mut out);
         counter = u128::from_be_bytes(counter).wrapping_add(1).to_be_bytes();
     }
-    out
+    (out, trace)
 }
 
 #[cfg(test)]
