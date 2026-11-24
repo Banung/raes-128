@@ -1,9 +1,28 @@
 //! AES-128 block cipher modes of operation: ECB, CBC, PCBC, CFB, OFB, and CTR.
 
+use std::borrow::Cow;
+
 use super::AesError;
 use super::cipher::{Aes128, BLOCK_SIZE};
 use super::padding::{pkcs7_pad, pkcs7_unpad};
 use super::trace::{BlockTrace, FirstBlockModeTrace, TraceDirection};
+
+/// Block padding scheme for block-oriented AES-128 modes (`ECB`, `CBC`, `PCBC`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaddingMode {
+    Pkcs7,
+    None,
+}
+
+impl PaddingMode {
+    /// Returns the human-readable UI label for this padding mode.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Pkcs7 => "PKCS#7",
+            Self::None => "None (Raw)",
+        }
+    }
+}
 
 /// Supported AES-128 modes of operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +51,11 @@ impl CipherMode {
         !matches!(self, Self::Ecb)
     }
 
+    /// Returns `true` if this mode operates on full blocks and applies block padding (`ECB`, `CBC`, `PCBC`).
+    pub const fn uses_padding(self) -> bool {
+        matches!(self, Self::Ecb | Self::Cbc | Self::Pcbc)
+    }
+
     /// Returns the uppercase standard name of this cipher mode.
     pub const fn name(self) -> &'static str {
         match self {
@@ -45,7 +69,7 @@ impl CipherMode {
     }
 }
 
-/// Encrypts `plaintext` with AES-128 under the specified [`CipherMode`].
+/// Encrypts `plaintext` with AES-128 under the specified [`CipherMode`] using PKCS#7 padding.
 ///
 /// `Ecb`, `Cbc`, and `Pcbc` apply PKCS#7 padding; `Cfb`, `Ofb`, and `Ctr` operate
 /// on arbitrary byte lengths without padding.
@@ -55,20 +79,45 @@ pub fn encrypt(
     iv: Option<&[u8]>,
     plaintext: &[u8],
 ) -> Result<Vec<u8>, AesError> {
-    encrypt_inner(mode, key, iv, plaintext, false).map(|(out, _)| out)
+    encrypt_with_padding(mode, PaddingMode::Pkcs7, key, iv, plaintext)
 }
 
-/// Encrypts `plaintext` with AES-128 under `mode` and captures a first-block trace.
+/// Encrypts `plaintext` with AES-128 under `mode` using PKCS#7 padding and captures a first-block trace.
 pub fn encrypt_with_trace(
     mode: CipherMode,
     key: &[u8],
     iv: Option<&[u8]>,
     plaintext: &[u8],
 ) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
-    encrypt_inner(mode, key, iv, plaintext, true)
+    encrypt_with_padding_and_trace(mode, PaddingMode::Pkcs7, key, iv, plaintext)
 }
 
-/// Decrypts `ciphertext` with AES-128 under the specified [`CipherMode`].
+/// Encrypts `plaintext` with AES-128 under `mode` and explicit [`PaddingMode`].
+///
+/// For `Ecb`, `Cbc`, and `Pcbc`, `PaddingMode::None` requires a non-empty multiple-of-16
+/// `plaintext` length; `Cfb`, `Ofb`, and `Ctr` ignore `padding`.
+pub fn encrypt_with_padding(
+    mode: CipherMode,
+    padding: PaddingMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, AesError> {
+    encrypt_inner(mode, padding, key, iv, plaintext, false).map(|(out, _)| out)
+}
+
+/// Encrypts `plaintext` with AES-128 under `mode` and explicit [`PaddingMode`], capturing a first-block trace.
+pub fn encrypt_with_padding_and_trace(
+    mode: CipherMode,
+    padding: PaddingMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
+    encrypt_inner(mode, padding, key, iv, plaintext, true)
+}
+
+/// Decrypts `ciphertext` with AES-128 under the specified [`CipherMode`] using PKCS#7 unpadding.
 ///
 /// `Ecb`, `Cbc`, and `Pcbc` require a non-empty multiple-of-16 ciphertext length
 /// and verify/strip PKCS#7 padding; `Cfb`, `Ofb`, and `Ctr` accept arbitrary byte lengths.
@@ -78,21 +127,47 @@ pub fn decrypt(
     iv: Option<&[u8]>,
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, AesError> {
-    decrypt_inner(mode, key, iv, ciphertext, false).map(|(out, _)| out)
+    decrypt_with_padding(mode, PaddingMode::Pkcs7, key, iv, ciphertext)
 }
 
-/// Decrypts `ciphertext` with AES-128 under `mode` and captures a first-block trace.
+/// Decrypts `ciphertext` with AES-128 under `mode` using PKCS#7 unpadding and captures a first-block trace.
 pub fn decrypt_with_trace(
     mode: CipherMode,
     key: &[u8],
     iv: Option<&[u8]>,
     ciphertext: &[u8],
 ) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
-    decrypt_inner(mode, key, iv, ciphertext, true)
+    decrypt_with_padding_and_trace(mode, PaddingMode::Pkcs7, key, iv, ciphertext)
+}
+
+/// Decrypts `ciphertext` with AES-128 under `mode` and explicit [`PaddingMode`].
+///
+/// For `Ecb`, `Cbc`, and `Pcbc`, `PaddingMode::None` skips PKCS#7 validation/unpadding and
+/// returns raw decrypted blocks; `Cfb`, `Ofb`, and `Ctr` ignore `padding`.
+pub fn decrypt_with_padding(
+    mode: CipherMode,
+    padding: PaddingMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    ciphertext: &[u8],
+) -> Result<Vec<u8>, AesError> {
+    decrypt_inner(mode, padding, key, iv, ciphertext, false).map(|(out, _)| out)
+}
+
+/// Decrypts `ciphertext` with AES-128 under `mode` and explicit [`PaddingMode`], capturing a first-block trace.
+pub fn decrypt_with_padding_and_trace(
+    mode: CipherMode,
+    padding: PaddingMode,
+    key: &[u8],
+    iv: Option<&[u8]>,
+    ciphertext: &[u8],
+) -> Result<(Vec<u8>, Option<FirstBlockModeTrace>), AesError> {
+    decrypt_inner(mode, padding, key, iv, ciphertext, true)
 }
 
 fn encrypt_inner(
     mode: CipherMode,
+    padding: PaddingMode,
     key: &[u8],
     iv: Option<&[u8]>,
     plaintext: &[u8],
@@ -102,15 +177,21 @@ fn encrypt_inner(
 
     match mode {
         CipherMode::Ecb => {
-            let (out, bt) = encrypt_ecb(&cipher, plaintext, capture_trace);
+            let blocks = prepare_block_plaintext(plaintext, padding)?;
+            let (out, bt) = encrypt_ecb(&cipher, &blocks, capture_trace);
+            let note = match padding {
+                PaddingMode::Pkcs7 => {
+                    "ECB encrypts PKCS#7-padded block 0 directly without an IV (C0 = E_K(P0))."
+                }
+                PaddingMode::None => {
+                    "ECB encrypts raw block 0 directly without padding or IV (C0 = E_K(P0))."
+                }
+            };
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Encrypt,
-                note: "ECB encrypts PKCS#7-padded block 0 directly without an IV (C0 = E_K(P0))."
-                    .to_string(),
-                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
-                    [..BLOCK_SIZE]
-                    .to_vec(),
+                note: note.to_string(),
+                source_block: blocks[..BLOCK_SIZE].to_vec(),
                 iv: None,
                 result_block: out[..BLOCK_SIZE].to_vec(),
                 block_trace,
@@ -119,15 +200,21 @@ fn encrypt_inner(
         }
         CipherMode::Cbc => {
             let iv_arr = require_iv(iv)?;
-            let (out, bt) = encrypt_cbc(&cipher, iv_arr, plaintext, capture_trace);
+            let blocks = prepare_block_plaintext(plaintext, padding)?;
+            let (out, bt) = encrypt_cbc(&cipher, iv_arr, &blocks, capture_trace);
+            let note = match padding {
+                PaddingMode::Pkcs7 => {
+                    "CBC XORs PKCS#7-padded block 0 with IV before AES encryption (C0 = E_K(P0 XOR IV))."
+                }
+                PaddingMode::None => {
+                    "CBC XORs raw block 0 with IV before AES encryption without padding (C0 = E_K(P0 XOR IV))."
+                }
+            };
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Encrypt,
-                note: "CBC XORs PKCS#7-padded block 0 with IV before AES encryption (C0 = E_K(P0 XOR IV))."
-                    .to_string(),
-                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
-                    [..BLOCK_SIZE]
-                    .to_vec(),
+                note: note.to_string(),
+                source_block: blocks[..BLOCK_SIZE].to_vec(),
                 iv: Some(iv_arr),
                 result_block: out[..BLOCK_SIZE].to_vec(),
                 block_trace,
@@ -136,15 +223,21 @@ fn encrypt_inner(
         }
         CipherMode::Pcbc => {
             let iv_arr = require_iv(iv)?;
-            let (out, bt) = encrypt_pcbc(&cipher, iv_arr, plaintext, capture_trace);
+            let blocks = prepare_block_plaintext(plaintext, padding)?;
+            let (out, bt) = encrypt_pcbc(&cipher, iv_arr, &blocks, capture_trace);
+            let note = match padding {
+                PaddingMode::Pkcs7 => {
+                    "PCBC XORs block 0 with IV (C0 = E_K(P0 XOR IV)) and propagates P_i XOR C_i to subsequent blocks."
+                }
+                PaddingMode::None => {
+                    "PCBC XORs raw block 0 with IV without padding (C0 = E_K(P0 XOR IV)) and propagates P_i XOR C_i to subsequent blocks."
+                }
+            };
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Encrypt,
-                note: "PCBC XORs block 0 with IV (C0 = E_K(P0 XOR IV)) and propagates P_i XOR C_i to subsequent blocks."
-                    .to_string(),
-                source_block: pkcs7_pad(&plaintext[..plaintext.len().min(BLOCK_SIZE)])
-                    [..BLOCK_SIZE]
-                    .to_vec(),
+                note: note.to_string(),
+                source_block: blocks[..BLOCK_SIZE].to_vec(),
                 iv: Some(iv_arr),
                 result_block: out[..BLOCK_SIZE].to_vec(),
                 block_trace,
@@ -207,6 +300,7 @@ fn encrypt_inner(
 
 fn decrypt_inner(
     mode: CipherMode,
+    padding: PaddingMode,
     key: &[u8],
     iv: Option<&[u8]>,
     ciphertext: &[u8],
@@ -216,7 +310,7 @@ fn decrypt_inner(
 
     match mode {
         CipherMode::Ecb => {
-            let (out, bt) = decrypt_ecb(&cipher, ciphertext, capture_trace)?;
+            let (out, bt) = decrypt_ecb(&cipher, ciphertext, padding, capture_trace)?;
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Decrypt,
@@ -231,7 +325,7 @@ fn decrypt_inner(
         }
         CipherMode::Cbc => {
             let iv_arr = require_iv(iv)?;
-            let (out, bt) = decrypt_cbc(&cipher, iv_arr, ciphertext, capture_trace)?;
+            let (out, bt) = decrypt_cbc(&cipher, iv_arr, ciphertext, padding, capture_trace)?;
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Decrypt,
@@ -246,7 +340,7 @@ fn decrypt_inner(
         }
         CipherMode::Pcbc => {
             let iv_arr = require_iv(iv)?;
-            let (out, bt) = decrypt_pcbc(&cipher, iv_arr, ciphertext, capture_trace)?;
+            let (out, bt) = decrypt_pcbc(&cipher, iv_arr, ciphertext, padding, capture_trace)?;
             let trace = bt.map(|block_trace| FirstBlockModeTrace {
                 mode,
                 operation: TraceDirection::Decrypt,
@@ -342,6 +436,30 @@ fn require_iv(iv: Option<&[u8]>) -> Result<[u8; BLOCK_SIZE], AesError> {
     })
 }
 
+fn prepare_block_plaintext(
+    plaintext: &[u8],
+    padding: PaddingMode,
+) -> Result<Cow<'_, [u8]>, AesError> {
+    match padding {
+        PaddingMode::Pkcs7 => Ok(Cow::Owned(pkcs7_pad(plaintext))),
+        PaddingMode::None => {
+            if plaintext.is_empty() || plaintext.len() % BLOCK_SIZE != 0 {
+                return Err(AesError::InvalidPlaintextLength {
+                    actual: plaintext.len(),
+                });
+            }
+            Ok(Cow::Borrowed(plaintext))
+        }
+    }
+}
+
+fn finish_block_plaintext(raw: Vec<u8>, padding: PaddingMode) -> Result<Vec<u8>, AesError> {
+    match padding {
+        PaddingMode::Pkcs7 => pkcs7_unpad(&raw),
+        PaddingMode::None => Ok(raw),
+    }
+}
+
 fn ensure_block_aligned(ciphertext: &[u8]) -> Result<(), AesError> {
     if ciphertext.is_empty() || ciphertext.len() % BLOCK_SIZE != 0 {
         return Err(AesError::InvalidCiphertextLength {
@@ -403,13 +521,12 @@ fn decrypt_block_maybe_trace(
 
 fn encrypt_ecb(
     cipher: &Aes128,
-    plaintext: &[u8],
+    blocks: &[u8],
     capture_trace: bool,
 ) -> (Vec<u8>, Option<BlockTrace>) {
-    let padded = pkcs7_pad(plaintext);
-    let mut out = Vec::with_capacity(padded.len());
+    let mut out = Vec::with_capacity(blocks.len());
     let mut trace = None;
-    for chunk in padded.chunks_exact(BLOCK_SIZE) {
+    for chunk in blocks.chunks_exact(BLOCK_SIZE) {
         let encrypted =
             encrypt_block_maybe_trace(cipher, to_block(chunk), capture_trace, &mut trace);
         out.extend_from_slice(&encrypted);
@@ -420,32 +537,32 @@ fn encrypt_ecb(
 fn decrypt_ecb(
     cipher: &Aes128,
     ciphertext: &[u8],
+    padding: PaddingMode,
     capture_trace: bool,
 ) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
-    let mut padded = Vec::with_capacity(ciphertext.len());
+    let mut raw = Vec::with_capacity(ciphertext.len());
     let mut trace = None;
     for chunk in ciphertext.chunks_exact(BLOCK_SIZE) {
         let decrypted =
             decrypt_block_maybe_trace(cipher, to_block(chunk), capture_trace, &mut trace);
-        padded.extend_from_slice(&decrypted);
+        raw.extend_from_slice(&decrypted);
     }
-    let unpadded = pkcs7_unpad(&padded)?;
-    Ok((unpadded, trace))
+    let out = finish_block_plaintext(raw, padding)?;
+    Ok((out, trace))
 }
 
 fn encrypt_cbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
-    plaintext: &[u8],
+    blocks: &[u8],
     capture_trace: bool,
 ) -> (Vec<u8>, Option<BlockTrace>) {
-    let padded = pkcs7_pad(plaintext);
-    let mut out = Vec::with_capacity(padded.len());
+    let mut out = Vec::with_capacity(blocks.len());
     let mut prev = iv;
     let mut trace = None;
 
-    for chunk in padded.chunks_exact(BLOCK_SIZE) {
+    for chunk in blocks.chunks_exact(BLOCK_SIZE) {
         let block = xor_block(to_block(chunk), prev);
         let encrypted = encrypt_block_maybe_trace(cipher, block, capture_trace, &mut trace);
         out.extend_from_slice(&encrypted);
@@ -458,10 +575,11 @@ fn decrypt_cbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
     ciphertext: &[u8],
+    padding: PaddingMode,
     capture_trace: bool,
 ) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
-    let mut padded = Vec::with_capacity(ciphertext.len());
+    let mut raw = Vec::with_capacity(ciphertext.len());
     let mut prev = iv;
     let mut trace = None;
 
@@ -469,25 +587,24 @@ fn decrypt_cbc(
         let c = to_block(chunk);
         let decrypted = decrypt_block_maybe_trace(cipher, c, capture_trace, &mut trace);
         let p = xor_block(decrypted, prev);
-        padded.extend_from_slice(&p);
+        raw.extend_from_slice(&p);
         prev = c;
     }
-    let unpadded = pkcs7_unpad(&padded)?;
-    Ok((unpadded, trace))
+    let out = finish_block_plaintext(raw, padding)?;
+    Ok((out, trace))
 }
 
 fn encrypt_pcbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
-    plaintext: &[u8],
+    blocks: &[u8],
     capture_trace: bool,
 ) -> (Vec<u8>, Option<BlockTrace>) {
-    let padded = pkcs7_pad(plaintext);
-    let mut out = Vec::with_capacity(padded.len());
+    let mut out = Vec::with_capacity(blocks.len());
     let mut prev_mask = iv;
     let mut trace = None;
 
-    for chunk in padded.chunks_exact(BLOCK_SIZE) {
+    for chunk in blocks.chunks_exact(BLOCK_SIZE) {
         let p = to_block(chunk);
         let c = encrypt_block_maybe_trace(
             cipher,
@@ -517,7 +634,7 @@ fn decrypt_pcbc_raw_inner(
     capture_trace: bool,
 ) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
     ensure_block_aligned(ciphertext)?;
-    let mut padded = Vec::with_capacity(ciphertext.len());
+    let mut raw = Vec::with_capacity(ciphertext.len());
     let mut prev_mask = iv;
     let mut trace = None;
 
@@ -525,21 +642,22 @@ fn decrypt_pcbc_raw_inner(
         let c = to_block(chunk);
         let decrypted = decrypt_block_maybe_trace(cipher, c, capture_trace, &mut trace);
         let p = xor_block(decrypted, prev_mask);
-        padded.extend_from_slice(&p);
+        raw.extend_from_slice(&p);
         prev_mask = xor_block(p, c);
     }
-    Ok((padded, trace))
+    Ok((raw, trace))
 }
 
 fn decrypt_pcbc(
     cipher: &Aes128,
     iv: [u8; BLOCK_SIZE],
     ciphertext: &[u8],
+    padding: PaddingMode,
     capture_trace: bool,
 ) -> Result<(Vec<u8>, Option<BlockTrace>), AesError> {
-    let (padded, trace) = decrypt_pcbc_raw_inner(cipher, iv, ciphertext, capture_trace)?;
-    let unpadded = pkcs7_unpad(&padded)?;
-    Ok((unpadded, trace))
+    let (raw, trace) = decrypt_pcbc_raw_inner(cipher, iv, ciphertext, capture_trace)?;
+    let out = finish_block_plaintext(raw, padding)?;
+    Ok((out, trace))
 }
 
 fn encrypt_cfb(
@@ -645,6 +763,15 @@ mod tests {
             CipherMode::ALL.map(CipherMode::name),
             ["ECB", "CBC", "PCBC", "CFB", "OFB", "CTR"]
         );
+
+        assert!(CipherMode::Ecb.uses_padding());
+        assert!(CipherMode::Cbc.uses_padding());
+        assert!(CipherMode::Pcbc.uses_padding());
+        assert!(!CipherMode::Cfb.uses_padding());
+        assert!(!CipherMode::Ofb.uses_padding());
+        assert!(!CipherMode::Ctr.uses_padding());
+        assert_eq!(PaddingMode::Pkcs7.label(), "PKCS#7");
+        assert_eq!(PaddingMode::None.label(), "None (Raw)");
     }
 
     #[test]
@@ -895,6 +1022,195 @@ mod tests {
                 decrypt(mode, &key, mode_iv, &ct),
                 Err(AesError::InvalidPadding)
             );
+        }
+    }
+
+    #[test]
+    fn padding_none_nist_1block_4block_and_pcbc_round_trip() {
+        // FIPS 197 Appendix B (1 block, ECB, raw)
+        let fips_key = hex_decode(NIST_KEY).unwrap();
+        let fips_pt = hex_decode("3243f6a8885a308d313198a2e0370734").unwrap();
+        let fips_expected = hex_decode("3925841d02dc09fbdc118597196a0b32").unwrap();
+        let fips_ct =
+            encrypt_with_padding(CipherMode::Ecb, PaddingMode::None, &fips_key, None, &fips_pt)
+                .unwrap();
+        assert_eq!(fips_ct, fips_expected);
+        assert_eq!(
+            decrypt_with_padding(CipherMode::Ecb, PaddingMode::None, &fips_key, None, &fips_ct)
+                .unwrap(),
+            fips_pt
+        );
+
+        // NIST SP 800-38A F.1.1 (4 blocks, ECB, no trailing padding block)
+        let pt4 = hex_decode(NIST_PLAINTEXT).unwrap();
+        let ecb4_expected = hex_decode(concat!(
+            "3ad77bb40d7a3660a89ecaf32466ef97",
+            "f5d3d58503b9699de785895a96fdbaaf",
+            "43b1cd7f598ece23881b00e3ed030688",
+            "7b0c785e27e8ad3f8223207104725dd4"
+        ))
+        .unwrap();
+        let ecb4_ct =
+            encrypt_with_padding(CipherMode::Ecb, PaddingMode::None, &fips_key, None, &pt4)
+                .unwrap();
+        assert_eq!(ecb4_ct.len(), 64);
+        assert_eq!(ecb4_ct, ecb4_expected);
+        assert_eq!(
+            decrypt_with_padding(CipherMode::Ecb, PaddingMode::None, &fips_key, None, &ecb4_ct)
+                .unwrap(),
+            pt4
+        );
+
+        // NIST SP 800-38A F.2.1 (1-block & 4-block CBC, no trailing padding block)
+        let iv = hex_decode(NIST_IV).unwrap();
+        let cbc4_expected = hex_decode(concat!(
+            "7649abac8119b246cee98e9b12e9197d",
+            "5086cb9b507219ee95db113a917678b2",
+            "73bed6b8e3c1743b7116e69e22229516",
+            "3ff1caa1681fac09120eca307586e1a7"
+        ))
+        .unwrap();
+        let cbc1_ct = encrypt_with_padding(
+            CipherMode::Cbc,
+            PaddingMode::None,
+            &fips_key,
+            Some(&iv),
+            &pt4[..16],
+        )
+        .unwrap();
+        assert_eq!(cbc1_ct, &cbc4_expected[..16]);
+        assert_eq!(
+            decrypt_with_padding(
+                CipherMode::Cbc,
+                PaddingMode::None,
+                &fips_key,
+                Some(&iv),
+                &cbc1_ct
+            )
+            .unwrap(),
+            &pt4[..16]
+        );
+
+        let cbc4_ct = encrypt_with_padding(
+            CipherMode::Cbc,
+            PaddingMode::None,
+            &fips_key,
+            Some(&iv),
+            &pt4,
+        )
+        .unwrap();
+        assert_eq!(cbc4_ct.len(), 64);
+        assert_eq!(cbc4_ct, cbc4_expected);
+        assert_eq!(
+            decrypt_with_padding(
+                CipherMode::Cbc,
+                PaddingMode::None,
+                &fips_key,
+                Some(&iv),
+                &cbc4_ct
+            )
+            .unwrap(),
+            pt4
+        );
+
+        // PCBC 1-block and 4-block round-trip without padding
+        for input in [&pt4[..16], pt4.as_slice()] {
+            let pcbc_ct = encrypt_with_padding(
+                CipherMode::Pcbc,
+                PaddingMode::None,
+                &fips_key,
+                Some(&iv),
+                input,
+            )
+            .unwrap();
+            assert_eq!(pcbc_ct.len(), input.len());
+            assert_eq!(
+                decrypt_with_padding(
+                    CipherMode::Pcbc,
+                    PaddingMode::None,
+                    &fips_key,
+                    Some(&iv),
+                    &pcbc_ct
+                )
+                .unwrap(),
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn padding_none_rejects_unaligned_block_modes_but_allows_stream_modes() {
+        let key = hex_decode(NIST_KEY).unwrap();
+        let iv = hex_decode(NIST_IV).unwrap();
+
+        for mode in [CipherMode::Ecb, CipherMode::Cbc, CipherMode::Pcbc] {
+            let mode_iv = mode.requires_iv().then_some(iv.as_slice());
+            for len in [0usize, 1, 15, 17] {
+                let pt = vec![0xabu8; len];
+                assert_eq!(
+                    encrypt_with_padding(mode, PaddingMode::None, &key, mode_iv, &pt),
+                    Err(AesError::InvalidPlaintextLength { actual: len })
+                );
+                assert_eq!(
+                    encrypt_with_padding_and_trace(mode, PaddingMode::None, &key, mode_iv, &pt),
+                    Err(AesError::InvalidPlaintextLength { actual: len })
+                );
+            }
+        }
+
+        for mode in [CipherMode::Cfb, CipherMode::Ofb, CipherMode::Ctr] {
+            for len in [0usize, 1, 15, 17] {
+                let pt = vec![0xabu8; len];
+                let (ct, trace) = encrypt_with_padding_and_trace(
+                    mode,
+                    PaddingMode::None,
+                    &key,
+                    Some(&iv),
+                    &pt,
+                )
+                .unwrap();
+                assert_eq!(
+                    ct,
+                    encrypt(mode, &key, Some(&iv), &pt).unwrap()
+                );
+                if len == 0 {
+                    assert!(trace.is_none());
+                } else {
+                    assert!(trace.is_some());
+                }
+                let (dec, _) = decrypt_with_padding_and_trace(
+                    mode,
+                    PaddingMode::None,
+                    &key,
+                    Some(&iv),
+                    &ct,
+                )
+                .unwrap();
+                assert_eq!(dec, pt);
+            }
+        }
+    }
+
+    #[test]
+    fn padding_none_trace_records_raw_source_block_and_matches_output() {
+        let key = hex_decode(NIST_KEY).unwrap();
+        let iv = hex_decode(NIST_IV).unwrap();
+        let pt = hex_decode(NIST_PLAINTEXT).unwrap();
+
+        for mode in [CipherMode::Ecb, CipherMode::Cbc, CipherMode::Pcbc] {
+            let mode_iv = mode.requires_iv().then_some(iv.as_slice());
+            let expected_ct =
+                encrypt_with_padding(mode, PaddingMode::None, &key, mode_iv, &pt).unwrap();
+            let (ct, trace_opt) =
+                encrypt_with_padding_and_trace(mode, PaddingMode::None, &key, mode_iv, &pt)
+                    .unwrap();
+            assert_eq!(ct, expected_ct);
+
+            let trace = trace_opt.expect("raw block mode should produce a trace");
+            assert_eq!(trace.source_block, pt[..BLOCK_SIZE]);
+            assert_eq!(trace.result_block, ct[..BLOCK_SIZE]);
+            assert!(trace.note.contains("raw block 0"));
+            assert!(trace.note.contains("without padding"));
         }
     }
 }

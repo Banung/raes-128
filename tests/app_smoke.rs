@@ -396,3 +396,71 @@ fn captures_trace_for_decrypt_and_file_operations(cx: &mut TestAppContext) {
     })
     .expect("run trace decrypt and file ui test");
 }
+
+#[gpui_kit::test]
+fn verifies_fips_197_appendix_b_preset_and_raw_block_round_trip(cx: &mut TestAppContext) {
+    let handle = open_test_app(cx);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.click("preset-fips197-app-b", cx);
+        window.click("btn-encrypt", cx);
+
+        assert_eq!(output_text_value(window), "3925841d02dc09fbdc118597196a0b32");
+
+        window.click("tab-trace", cx);
+        let trace = trace_text_value(window);
+        assert!(trace.contains("AES-128-ECB"));
+        assert!(trace.contains("3243f6a8885a308d313198a2e0370734"));
+        assert!(trace.contains("3925841d02dc09fbdc118597196a0b32"));
+        assert!(trace.contains("d4 e0 b8 1e"));
+        assert!(trace.contains("d4bf5d30e0b452aeb84111f11e2798e5"));
+
+        window.click("tab-text", cx);
+        window.click("btn-swap", cx);
+        window.click("btn-decrypt", cx);
+
+        assert_eq!(output_text_value(window), "3243f6a8885a308d313198a2e0370734");
+        let status = status_text(window);
+        assert!(
+            status.starts_with("Decrypted"),
+            "expected Decrypted status, got {status:?}"
+        );
+        assert!(
+            !status.contains("non-UTF-8"),
+            "expected hex plaintext decrypt without non-UTF-8 fallback wording, got {status:?}"
+        );
+    })
+    .expect("run fips 197 appendix b preset ui test");
+}
+
+#[gpui_kit::test]
+fn rejects_unaligned_plaintext_in_none_padding_mode_and_disables_padding_for_ctr(
+    cx: &mut TestAppContext,
+) {
+    let handle = open_test_app(cx);
+
+    cx.update_window(handle, |_, window, cx| {
+        window.click("mode-ctr", cx);
+        assert_eq!(window.find("pad-pkcs7").disabled(), Some(true));
+        assert_eq!(window.find("pad-none").disabled(), Some(true));
+
+        window.click("mode-ecb", cx);
+        assert_eq!(window.find("pad-none").disabled(), None);
+        window.click("pad-none", cx);
+
+        window.click("key-input", cx);
+        window.input("0123456789abcdef", cx);
+
+        window.click("input-text", cx);
+        window.input("short", cx);
+
+        window.click("btn-encrypt", cx);
+
+        let status = status_text(window);
+        assert!(
+            status.starts_with("Error:") && status.contains("invalid plaintext length"),
+            "expected invalid plaintext length error, got {status:?}"
+        );
+    })
+    .expect("run none padding error and ctr disable ui test");
+}

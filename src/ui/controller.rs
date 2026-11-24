@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::aes::{
-    AesError, BLOCK_SIZE, CipherMode, FirstBlockModeTrace, base64_decode, base64_encode,
-    decrypt_with_trace, encrypt_with_trace, hex_decode, hex_encode,
+    AesError, BLOCK_SIZE, CipherMode, FirstBlockModeTrace, PaddingMode, base64_decode,
+    base64_encode, decrypt_with_padding_and_trace, encrypt_with_padding_and_trace, hex_decode,
+    hex_encode,
 };
 
 /// Input representation for 16-byte AES-128 keys and initialization vectors.
@@ -23,6 +24,23 @@ impl KeyFormat {
         match self {
             Self::Utf8 => "UTF-8 (16 B)",
             Self::Hex => "Hex (32 chars)",
+        }
+    }
+}
+
+/// Text encoding format for plaintext input/output in the UI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaintextFormat {
+    Utf8,
+    Hex,
+}
+
+impl PlaintextFormat {
+    /// Returns the human-readable UI label for this plaintext format.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Utf8 => "UTF-8",
+            Self::Hex => "Hex",
         }
     }
 }
@@ -48,13 +66,78 @@ impl CiphertextFormat {
 #[derive(Debug, Clone, Copy)]
 pub struct CryptoRequest<'a> {
     pub mode: CipherMode,
+    pub padding: PaddingMode,
     pub key_format: KeyFormat,
     pub key_text: &'a str,
     pub iv_format: KeyFormat,
     pub iv_text: &'a str,
+    pub plaintext_format: PlaintextFormat,
     pub ciphertext_format: CiphertextFormat,
     pub input_text: &'a str,
 }
+
+/// Pre-configured NIST/FIPS standard AES-128 test vector preset for 1-click GUI verification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestVectorPreset {
+    pub id: &'static str,
+    pub label: &'static str,
+    pub mode: CipherMode,
+    pub padding: PaddingMode,
+    pub key_format: KeyFormat,
+    pub key_text: &'static str,
+    pub iv_format: KeyFormat,
+    pub iv_text: &'static str,
+    pub plaintext_format: PlaintextFormat,
+    pub plaintext_text: &'static str,
+    pub ciphertext_format: CiphertextFormat,
+    pub expected_ciphertext_hex: &'static str,
+}
+
+/// Standard NIST FIPS 197 and SP 800-38A test vector presets.
+pub const STANDARD_TEST_VECTORS: [TestVectorPreset; 3] = [
+    TestVectorPreset {
+        id: "fips197-app-b",
+        label: "FIPS 197 App. B",
+        mode: CipherMode::Ecb,
+        padding: PaddingMode::None,
+        key_format: KeyFormat::Hex,
+        key_text: "2b7e151628aed2a6abf7158809cf4f3c",
+        iv_format: KeyFormat::Hex,
+        iv_text: "",
+        plaintext_format: PlaintextFormat::Hex,
+        plaintext_text: "3243f6a8885a308d313198a2e0370734",
+        ciphertext_format: CiphertextFormat::Hex,
+        expected_ciphertext_hex: "3925841d02dc09fbdc118597196a0b32",
+    },
+    TestVectorPreset {
+        id: "fips197-app-c1",
+        label: "FIPS 197 App. C.1",
+        mode: CipherMode::Ecb,
+        padding: PaddingMode::None,
+        key_format: KeyFormat::Hex,
+        key_text: "000102030405060708090a0b0c0d0e0f",
+        iv_format: KeyFormat::Hex,
+        iv_text: "",
+        plaintext_format: PlaintextFormat::Hex,
+        plaintext_text: "00112233445566778899aabbccddeeff",
+        ciphertext_format: CiphertextFormat::Hex,
+        expected_ciphertext_hex: "69c4e0d86a7b0430d8cdb78070b4c55a",
+    },
+    TestVectorPreset {
+        id: "nist-cbc-f21",
+        label: "NIST CBC F.2.1",
+        mode: CipherMode::Cbc,
+        padding: PaddingMode::None,
+        key_format: KeyFormat::Hex,
+        key_text: "2b7e151628aed2a6abf7158809cf4f3c",
+        iv_format: KeyFormat::Hex,
+        iv_text: "000102030405060708090a0b0c0d0e0f",
+        plaintext_format: PlaintextFormat::Hex,
+        plaintext_text: "6bc1bee22e409f96e93d7e117393172a",
+        ciphertext_format: CiphertextFormat::Hex,
+        expected_ciphertext_hex: "7649abac8119b246cee98e9b12e9197d",
+    },
+];
 
 /// Output and metadata returned by [`run_encrypt`] and [`run_decrypt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,14 +210,20 @@ fn parse_key_and_iv(req: &CryptoRequest<'_>) -> Result<([u8; 16], Option<[u8; 16
     )
 }
 
-/// Validates inputs, encrypts UTF-8 `input_text`, and formats the resulting ciphertext.
+/// Validates inputs, parses plaintext according to `plaintext_format`, encrypts, and formats ciphertext.
 pub fn run_encrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
     let (key, iv) = parse_key_and_iv(req)?;
-    let (ciphertext, trace) = encrypt_with_trace(
+    let plaintext_bytes = match req.plaintext_format {
+        PlaintextFormat::Utf8 => req.input_text.as_bytes().to_vec(),
+        PlaintextFormat::Hex => hex_decode(req.input_text)?,
+    };
+    let input_bytes = plaintext_bytes.len();
+    let (ciphertext, trace) = encrypt_with_padding_and_trace(
         req.mode,
+        req.padding,
         &key,
         iv.as_ref().map(|b| b.as_slice()),
-        req.input_text.as_bytes(),
+        &plaintext_bytes,
     )?;
     let output = match req.ciphertext_format {
         CiphertextFormat::Hex => hex_encode(&ciphertext),
@@ -143,14 +232,14 @@ pub fn run_encrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
 
     Ok(CryptoSuccess {
         output,
-        input_bytes: req.input_text.len(),
+        input_bytes,
         output_bytes: ciphertext.len(),
         utf8_fallback_hex: false,
         trace,
     })
 }
 
-/// Validates inputs, decodes ciphertext, decrypts it, and converts plaintext to UTF-8 or hex.
+/// Validates inputs, decodes ciphertext, decrypts it, and converts plaintext to `plaintext_format` (or hex fallback).
 pub fn run_decrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
     let (key, iv) = parse_key_and_iv(req)?;
     let ciphertext = match req.ciphertext_format {
@@ -158,17 +247,21 @@ pub fn run_decrypt(req: &CryptoRequest<'_>) -> Result<CryptoSuccess, AesError> {
         CiphertextFormat::Base64 => base64_decode(req.input_text)?,
     };
     let input_bytes = ciphertext.len();
-    let (plaintext, trace) = decrypt_with_trace(
+    let (plaintext, trace) = decrypt_with_padding_and_trace(
         req.mode,
+        req.padding,
         &key,
         iv.as_ref().map(|b| b.as_slice()),
         &ciphertext,
     )?;
     let output_bytes = plaintext.len();
 
-    let (output, utf8_fallback_hex) = match String::from_utf8(plaintext) {
-        Ok(text) => (text, false),
-        Err(err) => (hex_encode(err.as_bytes()), true),
+    let (output, utf8_fallback_hex) = match req.plaintext_format {
+        PlaintextFormat::Hex => (hex_encode(&plaintext), false),
+        PlaintextFormat::Utf8 => match String::from_utf8(plaintext) {
+            Ok(text) => (text, false),
+            Err(err) => (hex_encode(err.as_bytes()), true),
+        },
     };
 
     Ok(CryptoSuccess {
@@ -243,10 +336,12 @@ mod tests {
                     for ciphertext_format in [CiphertextFormat::Hex, CiphertextFormat::Base64] {
                         let enc_req = CryptoRequest {
                             mode,
+                            padding: PaddingMode::Pkcs7,
                             key_format,
                             key_text,
                             iv_format,
                             iv_text,
+                            plaintext_format: PlaintextFormat::Utf8,
                             ciphertext_format,
                             input_text: plaintext,
                         };
@@ -256,10 +351,12 @@ mod tests {
 
                         let dec_req = CryptoRequest {
                             mode,
+                            padding: PaddingMode::Pkcs7,
                             key_format,
                             key_text,
                             iv_format,
                             iv_text,
+                            plaintext_format: PlaintextFormat::Utf8,
                             ciphertext_format,
                             input_text: &enc.output,
                         };
@@ -284,10 +381,12 @@ mod tests {
                 };
                 let enc_req = CryptoRequest {
                     mode,
+                    padding: PaddingMode::Pkcs7,
                     key_format: KeyFormat::Utf8,
                     key_text: UTF8_KEY,
                     iv_format,
                     iv_text,
+                    plaintext_format: PlaintextFormat::Utf8,
                     ciphertext_format: CiphertextFormat::Hex,
                     input_text: "secret",
                 };
@@ -322,10 +421,12 @@ mod tests {
 
         let res = run_decrypt(&CryptoRequest {
             mode: CipherMode::Cbc,
+            padding: PaddingMode::Pkcs7,
             key_format: KeyFormat::Hex,
             key_text: HEX_KEY,
             iv_format: KeyFormat::Hex,
             iv_text: HEX_IV,
+            plaintext_format: PlaintextFormat::Utf8,
             ciphertext_format: CiphertextFormat::Hex,
             input_text: &ciphertext_hex,
         })
@@ -374,10 +475,12 @@ mod tests {
 
         let bad_hex = CryptoRequest {
             mode: CipherMode::Ecb,
+            padding: PaddingMode::Pkcs7,
             key_format: KeyFormat::Utf8,
             key_text: UTF8_KEY,
             iv_format: KeyFormat::Utf8,
             iv_text: "",
+            plaintext_format: PlaintextFormat::Utf8,
             ciphertext_format: CiphertextFormat::Hex,
             input_text: "not-hex!",
         };
@@ -416,7 +519,99 @@ mod tests {
     fn format_labels_match_spec() {
         assert_eq!(KeyFormat::Utf8.label(), "UTF-8 (16 B)");
         assert_eq!(KeyFormat::Hex.label(), "Hex (32 chars)");
+        assert_eq!(PlaintextFormat::Utf8.label(), "UTF-8");
+        assert_eq!(PlaintextFormat::Hex.label(), "Hex");
+        assert_eq!(PaddingMode::Pkcs7.label(), "PKCS#7");
+        assert_eq!(PaddingMode::None.label(), "None (Raw)");
         assert_eq!(CiphertextFormat::Hex.label(), "Hex");
         assert_eq!(CiphertextFormat::Base64.label(), "Base64");
+    }
+
+    #[test]
+    fn standard_test_vector_presets_round_trip() {
+        for preset in STANDARD_TEST_VECTORS {
+            let enc = run_encrypt(&CryptoRequest {
+                mode: preset.mode,
+                padding: preset.padding,
+                key_format: preset.key_format,
+                key_text: preset.key_text,
+                iv_format: preset.iv_format,
+                iv_text: preset.iv_text,
+                plaintext_format: preset.plaintext_format,
+                ciphertext_format: preset.ciphertext_format,
+                input_text: preset.plaintext_text,
+            })
+            .unwrap_or_else(|e| panic!("preset {} encrypt failed: {e}", preset.id));
+
+            assert_eq!(enc.output, preset.expected_ciphertext_hex, "{}", preset.id);
+            assert_eq!(enc.input_bytes, 16);
+            assert_eq!(enc.output_bytes, 16);
+
+            let dec = run_decrypt(&CryptoRequest {
+                mode: preset.mode,
+                padding: preset.padding,
+                key_format: preset.key_format,
+                key_text: preset.key_text,
+                iv_format: preset.iv_format,
+                iv_text: preset.iv_text,
+                plaintext_format: preset.plaintext_format,
+                ciphertext_format: preset.ciphertext_format,
+                input_text: &enc.output,
+            })
+            .unwrap_or_else(|e| panic!("preset {} decrypt failed: {e}", preset.id));
+
+            assert_eq!(dec.output, preset.plaintext_text, "{}", preset.id);
+            assert!(!dec.utf8_fallback_hex, "{}", preset.id);
+            assert_eq!(dec.input_bytes, 16);
+            assert_eq!(dec.output_bytes, 16);
+        }
+    }
+
+    #[test]
+    fn hex_plaintext_and_padding_none_errors() {
+        let invalid_hex = run_encrypt(&CryptoRequest {
+            mode: CipherMode::Ecb,
+            padding: PaddingMode::None,
+            key_format: KeyFormat::Hex,
+            key_text: HEX_KEY,
+            iv_format: KeyFormat::Hex,
+            iv_text: "",
+            plaintext_format: PlaintextFormat::Hex,
+            ciphertext_format: CiphertextFormat::Hex,
+            input_text: "not-hex!",
+        });
+        assert!(matches!(invalid_hex, Err(AesError::InvalidHex(_))));
+
+        let unaligned_utf8 = run_encrypt(&CryptoRequest {
+            mode: CipherMode::Cbc,
+            padding: PaddingMode::None,
+            key_format: KeyFormat::Hex,
+            key_text: HEX_KEY,
+            iv_format: KeyFormat::Hex,
+            iv_text: HEX_IV,
+            plaintext_format: PlaintextFormat::Utf8,
+            ciphertext_format: CiphertextFormat::Hex,
+            input_text: "15-bytes-string",
+        });
+        assert_eq!(
+            unaligned_utf8,
+            Err(AesError::InvalidPlaintextLength { actual: 15 })
+        );
+
+        let unaligned_hex = run_encrypt(&CryptoRequest {
+            mode: CipherMode::Pcbc,
+            padding: PaddingMode::None,
+            key_format: KeyFormat::Hex,
+            key_text: HEX_KEY,
+            iv_format: KeyFormat::Hex,
+            iv_text: HEX_IV,
+            plaintext_format: PlaintextFormat::Hex,
+            ciphertext_format: CiphertextFormat::Hex,
+            input_text: "00112233",
+        });
+        assert_eq!(
+            unaligned_hex,
+            Err(AesError::InvalidPlaintextLength { actual: 4 })
+        );
     }
 }
