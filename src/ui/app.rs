@@ -15,8 +15,8 @@ use gpui_kit::component::{
 
 use crate::aes::{CipherMode, FirstBlockModeTrace, PaddingMode, format_trace_text};
 use crate::ui::controller::{
-    CiphertextFormat, CryptoRequest, KeyFormat, PlaintextFormat, generate_random_hex_16,
-    run_decrypt, run_encrypt,
+    CiphertextFormat, CryptoRequest, KeyFormat, PlaintextFormat, STANDARD_TEST_VECTORS,
+    TestVectorPreset, generate_random_hex_16, run_decrypt, run_encrypt,
 };
 use crate::ui::file_crypto::{
     FileCryptoRequest, decrypt_file, encrypt_file, suggested_output_path,
@@ -33,8 +33,10 @@ enum WorkspaceTab {
 pub struct RaesApp {
     active_tab: WorkspaceTab,
     mode: CipherMode,
+    padding_mode: PaddingMode,
     key_format: KeyFormat,
     iv_format: KeyFormat,
+    plaintext_format: PlaintextFormat,
     ciphertext_format: CiphertextFormat,
     key_input: Entity<InputState>,
     iv_input: Entity<InputState>,
@@ -84,8 +86,10 @@ impl RaesApp {
         Self {
             active_tab: WorkspaceTab::Text,
             mode: CipherMode::Cbc,
+            padding_mode: PaddingMode::Pkcs7,
             key_format: KeyFormat::Utf8,
             iv_format: KeyFormat::Hex,
+            plaintext_format: PlaintextFormat::Utf8,
             ciphertext_format: CiphertextFormat::Hex,
             key_input,
             iv_input,
@@ -122,12 +126,12 @@ impl RaesApp {
 
         let req = CryptoRequest {
             mode: self.mode,
-            padding: PaddingMode::Pkcs7,
+            padding: self.padding_mode,
             key_format: self.key_format,
             key_text: key_text.as_ref(),
             iv_format: self.iv_format,
             iv_text: iv_text.as_ref(),
-            plaintext_format: PlaintextFormat::Utf8,
+            plaintext_format: self.plaintext_format,
             ciphertext_format: self.ciphertext_format,
             input_text: input_text.as_ref(),
         };
@@ -174,6 +178,38 @@ impl RaesApp {
                 self.set_status(format!("Error: {err}"), true);
             }
         }
+        cx.notify();
+    }
+
+    fn apply_test_vector_preset(
+        &mut self,
+        preset: TestVectorPreset,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.mode = preset.mode;
+        self.padding_mode = preset.padding;
+        self.key_format = preset.key_format;
+        self.iv_format = preset.iv_format;
+        self.plaintext_format = preset.plaintext_format;
+        self.ciphertext_format = preset.ciphertext_format;
+
+        self.key_input
+            .update(cx, |state, cx| state.set_value(preset.key_text, window, cx));
+        self.iv_input
+            .update(cx, |state, cx| state.set_value(preset.iv_text, window, cx));
+        self.input_text
+            .update(cx, |state, cx| state.set_value(preset.plaintext_text, window, cx));
+        self.output_text
+            .update(cx, |state, cx| state.set_value("", window, cx));
+
+        self.set_status(
+            format!(
+                "Loaded preset {} (expected ciphertext: {})",
+                preset.label, preset.expected_ciphertext_hex
+            ),
+            false,
+        );
         cx.notify();
     }
 
@@ -388,18 +424,86 @@ fn toggle_button(id: &'static str, label: &'static str, active: bool, disabled: 
 
 impl RaesApp {
     fn render_text_workspace(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let uses_padding = self.mode.uses_padding();
+
         v_flex()
-            .gap_2p5()
+            .gap_2()
             .w_full()
-            // Ciphertext Format Row
+            // Row 1: Format & Padding Bar
             .child(
                 h_flex()
                     .justify_between()
                     .items_center()
-                    .child(Label::new("Ciphertext Format").font_semibold())
+                    .gap_3()
                     .child(
                         h_flex()
-                            .gap_2()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Label::new("Plaintext").font_semibold())
+                            .child(
+                                toggle_button(
+                                    "pt-fmt-utf8",
+                                    PlaintextFormat::Utf8.label(),
+                                    self.plaintext_format == PlaintextFormat::Utf8,
+                                    false,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.plaintext_format = PlaintextFormat::Utf8;
+                                    this.set_status("Plaintext format set to UTF-8", false);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                toggle_button(
+                                    "pt-fmt-hex",
+                                    PlaintextFormat::Hex.label(),
+                                    self.plaintext_format == PlaintextFormat::Hex,
+                                    false,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.plaintext_format = PlaintextFormat::Hex;
+                                    this.set_status("Plaintext format set to Hex", false);
+                                    cx.notify();
+                                })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Label::new("Padding").font_semibold())
+                            .child(
+                                toggle_button(
+                                    "pad-pkcs7",
+                                    PaddingMode::Pkcs7.label(),
+                                    self.padding_mode == PaddingMode::Pkcs7,
+                                    !uses_padding,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.padding_mode = PaddingMode::Pkcs7;
+                                    this.set_status("Padding set to PKCS#7", false);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                toggle_button(
+                                    "pad-none",
+                                    PaddingMode::None.label(),
+                                    self.padding_mode == PaddingMode::None,
+                                    !uses_padding,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.padding_mode = PaddingMode::None;
+                                    this.set_status("Padding set to None (Raw)", false);
+                                    cx.notify();
+                                })),
+                            ),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_1p5()
+                            .items_center()
+                            .child(Label::new("Ciphertext").font_semibold())
                             .child(
                                 toggle_button(
                                     "ct-fmt-hex",
@@ -428,6 +532,27 @@ impl RaesApp {
                             ),
                     ),
             )
+            // Row 2: NIST Test Vector Presets Bar
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .gap_2()
+                    .child(Label::new("Test Vectors").font_semibold())
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .items_center()
+                            .children(STANDARD_TEST_VECTORS.into_iter().map(|preset| {
+                                Button::new(SharedString::from(format!("preset-{}", preset.id)))
+                                    .outline()
+                                    .label(preset.label)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.apply_test_vector_preset(preset, window, cx);
+                                    }))
+                            })),
+                    ),
+            )
             // Input Textarea
             .child(
                 v_flex()
@@ -442,7 +567,7 @@ impl RaesApp {
                                 Textarea::new(&self.input_text)
                                     .accessibility_id("input-text")
                                     .aria_label("Input Text")
-                                    .h(px(120.0)),
+                                    .h(px(108.0)),
                             ),
                     ),
             )
@@ -525,7 +650,7 @@ impl RaesApp {
                                     .accessibility_id("output-text")
                                     .aria_label("Output Text")
                                     .readonly(true)
-                                    .h(px(120.0)),
+                                    .h(px(108.0)),
                             ),
                     ),
             )
